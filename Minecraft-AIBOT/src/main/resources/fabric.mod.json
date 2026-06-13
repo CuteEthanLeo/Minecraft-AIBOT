@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "aibot",
+  "version": "${version}",
+  "name": "AI Robot Companion",
+  "description": "Adds an AI-powered robot companion to Minecraft. Control it with natural language via DeepSeek API.",
+  "authors": ["AI Bot Developer"],
+  "contact": {
+    "homepage": "https://github.com/aibot",
+    "sources": "https://github.com/aibot"
+  },
+  "license": "MIT",
+  "icon": "assets/aibot/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.aibot.AIBotMod"
+    ],
+    "client": [
+      "com.aibot.AIBotMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": ">=1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "another-mod": "*"
+  }
+}

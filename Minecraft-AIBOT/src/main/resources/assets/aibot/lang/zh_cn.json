@@ -1,0 +1,18 @@
+{
+  "entity.aibot.robot": "AI 机器人",
+  "item.aibot.robot_spawn_egg": "AI 机器人刷怪蛋",
+  "chat.aibot.prefix": "§6[AI 机器人]§r",
+  "chat.aibot.no_api_key": "§c请在 config/robot-ai.json 中设置你的 DeepSeek API Key",
+  "chat.aibot.no_robot": "§c你附近没有属于你的机器人。右键点击机器人来绑定它。",
+  "chat.aibot.thinking": "§7思考中...§r",
+  "chat.aibot.error": "§c抱歉，我无法处理该指令。错误：%s",
+  "chat.aibot.following": "§a正在跟随你！",
+  "chat.aibot.staying": "§a待在这里等你回来。",
+  "chat.aibot.attacking": "§c正在攻击 %s！",
+  "chat.aibot.hungry": "§e我饿了，正在找食物...",
+  "robot.mode.follow": "跟随",
+  "robot.mode.stay": "待命",
+  "robot.mode.combat": "战斗",
+  "robot.mode.build": "建造",
+  "robot.mode.mine": "挖掘"
+}

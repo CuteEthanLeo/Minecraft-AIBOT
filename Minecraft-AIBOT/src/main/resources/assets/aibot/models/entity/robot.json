@@ -1,0 +1,86 @@
+{
+  "description": "AI Robot Entity Model",
+  "texture_width": 64,
+  "texture_height": 64,
+  "bones": [
+    {
+      "name": "body",
+      "pivot": [0, 16, 0],
+      "cubes": [
+        {
+          "origin": [-4, 10, -2],
+          "size": [8, 10, 4],
+          "uv": [16, 16]
+        }
+      ]
+    },
+    {
+      "name": "head",
+      "pivot": [0, 20, 0],
+      "cubes": [
+        {
+          "origin": [-4, 20, -4],
+          "size": [8, 8, 8],
+          "uv": [0, 0]
+        }
+      ]
+    },
+    {
+      "name": "right_arm",
+      "pivot": [-5, 18, 0],
+      "cubes": [
+        {
+          "origin": [-7, 10, -2],
+          "size": [3, 10, 4],
+          "uv": [40, 16]
+        }
+      ]
+    },
+    {
+      "name": "left_arm",
+      "pivot": [5, 18, 0],
+      "cubes": [
+        {
+          "origin": [4, 10, -2],
+          "size": [3, 10, 4],
+          "uv": [40, 16],
+          "mirror": true
+        }
+      ]
+    },
+    {
+      "name": "right_leg",
+      "pivot": [-2, 10, 0],
+      "cubes": [
+        {
+          "origin": [-4, 0, -2],
+          "size": [3, 10, 4],
+          "uv": [0, 16]
+        }
+      ]
+    },
+    {
+      "name": "left_leg",
+      "pivot": [2, 10, 0],
+      "cubes": [
+        {
+          "origin": [1, 0, -2],
+          "size": [3, 10, 4],
+          "uv": [0, 16],
+          "mirror": true
+        }
+      ]
+    },
+    {
+      "name": "antenna",
+      "pivot": [0, 28, 0],
+      "cubes": [
+        {
+          "origin": [-1, 28, -1],
+          "size": [2, 4, 2],
+          "uv": [32, 0]
+        }
+      ]
+    }
+  ]
+}

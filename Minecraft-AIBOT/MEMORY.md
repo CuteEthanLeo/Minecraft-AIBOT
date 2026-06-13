@@ -1,0 +1,2 @@
+- [Project Overview](.claude/projects/C--Users-cutee-Desktop-Minecraft-AIBOT/memory/project-overview.md) — Minecraft Fabric AI-Bot mod with DeepSeek integration
+- [Memory System](.claude/projects/C--Users-cutee-Desktop-Minecraft-AIBOT/memory/memory-system.md) — Persistent AI memory system design (per-world, per-player JSON storage)

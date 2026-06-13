@@ -1,0 +1,80 @@
+plugins {
+    id 'fabric-loom' version '1.13.6'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = "Fabric"
+        url = "https://maven.fabricmc.net/"
+    }
+}
+
+loom {
+    mods {
+        "aibot" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+dependencies {
+    // Minecraft 和映射
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // Fabric API
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // HTTP 客户端用于 API 调用
+    modImplementation "com.squareup.okhttp3:okhttp:4.12.0"
+    include "com.squareup.okhttp3:okhttp:4.12.0"
+    include "com.squareup.okio:okio:3.6.0"
+
+    // Gson 用于 JSON 解析
+    modImplementation "com.google.code.gson:gson:2.10.1"
+    include "com.google.code.gson:gson:2.10.1"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filteringCharset "UTF-8"
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
+
+publishing {
+    publications {
+        create("mavenJava", MavenPublication) {
+            artifactId = project.archives_base_name
+            from components.java
+        }
+    }
+}

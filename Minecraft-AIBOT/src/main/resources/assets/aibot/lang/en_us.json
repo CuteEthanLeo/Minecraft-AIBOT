@@ -1,0 +1,18 @@
+{
+  "entity.aibot.robot": "AI Robot",
+  "item.aibot.robot_spawn_egg": "AI Robot Spawn Egg",
+  "chat.aibot.prefix": "§6[AI Robot]§r",
+  "chat.aibot.no_api_key": "§cPlease set your DeepSeek API key in config/robot-ai.json",
+  "chat.aibot.no_robot": "§cYou don't have a robot nearby. Right-click a robot to bond with it first.",
+  "chat.aibot.thinking": "§7Thinking...§r",
+  "chat.aibot.error": "§cSorry, I couldn't process that command. Error: %s",
+  "chat.aibot.following": "§aNow following you!",
+  "chat.aibot.staying": "§aStaying here. I'll wait for you.",
+  "chat.aibot.attacking": "§cAttacking %s!",
+  "chat.aibot.hungry": "§eI'm hungry. Looking for food...",
+  "robot.mode.follow": "Follow",
+  "robot.mode.stay": "Stay",
+  "robot.mode.combat": "Combat",
+  "robot.mode.build": "Build",
+  "robot.mode.mine": "Mine"
+}
