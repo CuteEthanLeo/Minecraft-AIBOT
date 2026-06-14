@@ -244,11 +244,12 @@ public class MemoryManager {
 
         if (scored.isEmpty()) return "";
 
-        // Build compressed text; refresh each recalled memory
+        // Build compressed text; refresh each recalled memory (batched to reduce file writes)
         StringBuilder sb = new StringBuilder();
         sb.append("Player memories (things you should remember):\n");
         int tokenBudget = maxTokens;
         int charsPerToken = 4;
+        List<Memory> toRefresh = new ArrayList<>();
 
         for (Memory m : scored) {
             String entry = formatMemoryEntry(m);
@@ -273,9 +274,14 @@ public class MemoryManager {
                 }
             }
 
-            // Refresh: bump timestamp and recall count
+            // Queue for refresh (batch write)
             m.timestamp = System.currentTimeMillis();
             m.recallCount++;
+            toRefresh.add(m);
+        }
+
+        // Batch save all refreshed memories
+        for (Memory m : toRefresh) {
             saveMemory(worldName, playerUuid, m);
         }
 

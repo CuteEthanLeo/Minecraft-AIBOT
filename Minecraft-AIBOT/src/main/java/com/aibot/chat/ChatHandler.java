@@ -77,6 +77,14 @@ public class ChatHandler {
             return;
         }
 
+        // ── reload ──
+        if (cmd.equals("reload") || cmd.equals("重载")) {
+            BotConfig.reload();
+            player.sendMessage(ChatFormatter.success(BotConfig.load(),
+                zh ? "配置已重载 ✓" : "Config reloaded ✓"), false);
+            return;
+        }
+
         // ── generate ──
         if (cmd.equals("generate") || cmd.equals("生成")) {
             handleGenerate(player, config);
@@ -112,8 +120,13 @@ public class ChatHandler {
         }
 
         // ── memories ──
-        if (cmd.equals("memories") || cmd.equals("记忆列表")) {
-            handleListMemories(player, config);
+        if (cmd.equals("memories") || cmd.equals("记忆列表") || cmd.startsWith("memories ") || cmd.startsWith("记忆列表 ")) {
+            int page = 1;
+            String[] parts = cmd.split("\\s+");
+            if (parts.length >= 2) {
+                try { page = Math.max(1, Integer.parseInt(parts[1])); } catch (NumberFormatException ignored) {}
+            }
+            handleListMemories(player, config, page);
             return;
         }
 
@@ -193,6 +206,14 @@ public class ChatHandler {
             return;
         }
 
+        // ── status ──
+        if (cmd.equals("status") || cmd.equals("状态")) {
+            ServerWorld statusWorld = (ServerWorld) player.getEntityWorld();
+            RobotEntity statusRobot = findRobotInWorld(statusWorld);
+            handleStatus(player, config, statusRobot);
+            return;
+        }
+
         // ── API Key required below ──
         if (!config.hasApiKey()) {
             player.sendMessage(ChatFormatter.error(config,
@@ -216,20 +237,37 @@ public class ChatHandler {
         DeepSeekClient.sendCommand(player, cmd, robot)
             .thenAcceptAsync(actions -> {
                 if (actions.isEmpty()) {
-                    player.sendMessage(ChatFormatter.error(config,
-                        zh ? "指令处理失败。" : "Command failed."), false);
+                    // Check if there's a stored API error
+                    String apiErr = DeepSeekClient.getLastApiError();
+                    if (apiErr != null) {
+                        player.sendMessage(ChatFormatter.error(config,
+                            (zh ? "❌ API错误: " : "❌ API Error: ") + apiErr), false);
+                        player.sendMessage(ChatFormatter.info(config,
+                            zh ? "§7请检查 config/robot-ai.json 中的 API Key 和网络连接"
+                                : "§7Check API Key and network in config/robot-ai.json"), false);
+                    } else {
+                        player.sendMessage(ChatFormatter.error(config,
+                            zh ? "AI未能响应，请稍后重试。如持续失败请检查API Key。"
+                                : "AI did not respond, please try again. Check API Key if persists."), false);
+                    }
                     return;
                 }
 
                 StringBuilder chatReply = new StringBuilder();
                 List<RobotAI.QueuedAction> queue = new java.util.ArrayList<>();
+                boolean hasError = false;
 
                 for (var a : actions) {
                     switch (a.type) {
                         case CHAT -> {
                             if (a.message != null && !a.message.isBlank()) {
                                 if (!chatReply.isEmpty()) chatReply.append("\n");
-                                chatReply.append(a.message);
+                                String msg = ChatFormatter.stripFormatCodes(a.message);
+                                // Highlight error messages from API failures
+                                if (msg.contains("❌") || msg.contains("API")) {
+                                    hasError = true;
+                                }
+                                chatReply.append(msg);
                             }
                         }
                         case SCAN -> {
@@ -237,7 +275,20 @@ public class ChatHandler {
                             if (!chatReply.isEmpty()) chatReply.append("\n");
                             chatReply.append("§7").append(report);
                         }
-                        case COMMAND -> executeCommand(player, robot, a.command);
+                        case COMMAND -> {
+                            // Execute single command (if present)
+                            if (a.command != null && !a.command.isBlank()) {
+                                executeCommand(player, robot, a.command);
+                            }
+                            // Execute commands array (for multi-command custom builds)
+                            if (a.commands != null) {
+                                for (String singleCmd : a.commands) {
+                                    if (singleCmd != null && !singleCmd.isBlank()) {
+                                        executeCommand(player, robot, singleCmd);
+                                    }
+                                }
+                            }
+                        }
                         case TP -> {
                             // Teleport to requested coordinates if provided, otherwise to player
                             BlockPos tpPos = a.position;
@@ -259,7 +310,8 @@ public class ChatHandler {
                         default -> queue.add(new RobotAI.QueuedAction(
                             a.type, a.target, a.position, a.message,
                             a.itemName, a.quantity, a.command,
-                            a.structure, a.size, a.material));
+                            a.structure, a.size, a.material,
+                            a.description, a.commands));
                     }
                 }
 
@@ -268,9 +320,30 @@ public class ChatHandler {
                 // ── Send chat reply ──
                 if (!chatReply.isEmpty()) {
                     for (String line : chatReply.toString().split("\n")) {
-                        player.sendMessage(ChatFormatter.msg(config, "§7" + line), false);
+                        // Split lines longer than 250 chars to avoid MC client truncation
+                        String color = hasError ? "§c" : "§7";
+                        if (line.length() > 250) {
+                            int pos = 0;
+                            while (pos < line.length()) {
+                                int end = Math.min(pos + 250, line.length());
+                                String chunk = line.substring(pos, end);
+                                player.sendMessage(ChatFormatter.msg(config, color + chunk), false);
+                                pos = end;
+                            }
+                        } else {
+                            player.sendMessage(ChatFormatter.msg(config, color + line), false);
+                        }
                     }
-                } else if (!queue.isEmpty()) {
+                }
+
+                // ── Token limit warning ──
+                if (DeepSeekClient.wasContextTrimmed()) {
+                    player.sendMessage(ChatFormatter.warn(config,
+                        zh ? "对话上下文已达Token上限，较早的对话已被截断。使用 §d/bot clear §7清除历史"
+                            : "Context token limit reached, earlier messages trimmed. Use §d/bot clear §7to reset"), false);
+                }
+
+                if (!queue.isEmpty()) {
                     var first = queue.get(0);
                     String desc = switch (first.type()) {
                         case FOLLOW  -> "§a" + (zh ? "跟随" : "Follow");
@@ -285,7 +358,20 @@ public class ChatHandler {
                         case CRAFT   -> "§d" + (zh ? "合成" : "Craft") + " " + (first.itemName() != null ? first.itemName() : "");
                         case COMMAND -> "§5" + (zh ? "指令" : "Cmd");
                         case TP      -> "§5" + (zh ? "传送" : "TP");
-                        case BUILD   -> "§6" + (zh ? "建造" : "Build") + " " + (first.structure() != null ? first.structure() : "");
+                        case BUILD   -> {
+                            String buildInfo = "§6" + (zh ? "建造" : "Build");
+                            if (first.structure() != null && !first.structure().isBlank()) {
+                                buildInfo += " " + first.structure();
+                            } else if (first.description() != null && !first.description().isBlank()) {
+                                buildInfo += " " + (first.description().length() > 20
+                                    ? first.description().substring(0, 20) + "…"
+                                    : first.description());
+                            }
+                            if (first.commands() != null && !first.commands().isEmpty()) {
+                                buildInfo += " §8(+" + first.commands().size() + " commands)";
+                            }
+                            yield buildInfo;
+                        }
                         default      -> "§7" + (zh ? "执行" : "Exec");
                     };
                     player.sendMessage(ChatFormatter.action(config, desc + (zh ? "中…" : "…")), false);
@@ -295,7 +381,16 @@ public class ChatHandler {
                 if (w != null && w.getServer() != null) w.getServer().execute(runnable);
             })
             .exceptionally(ex -> {
-                player.sendMessage(ChatFormatter.error(config, ex.getMessage()), false);
+                String msg = ex.getMessage();
+                player.sendMessage(ChatFormatter.error(config,
+                    (zh ? "❌ 执行失败: " : "❌ Execution failed: ") + (msg != null ? msg : "unknown error")), false);
+                if (zh) {
+                    player.sendMessage(ChatFormatter.info(config,
+                        "§7请检查 config/robot-ai.json 配置，或使用 §d/bot reload §7重载"), false);
+                } else {
+                    player.sendMessage(ChatFormatter.info(config,
+                        "§7Check config/robot-ai.json or use §d/bot reload §7to reload"), false);
+                }
                 return null;
             });
     }
@@ -337,6 +432,9 @@ public class ChatHandler {
             .replace("~ry~", String.valueOf((int)player.getY()))
             .replace("~rz~", String.valueOf((int)player.getZ()));
 
+        // Resolve ~ coordinates relative to robot position before executing
+        cmd = resolveTildeCoords(cmd, ix, iy, iz);
+
         // ── SECURITY: Block dangerous commands ──
         String cmdLower = cmd.toLowerCase().trim();
         String commandName = cmdLower.contains(" ") ? cmdLower.substring(0, cmdLower.indexOf(' ')) : cmdLower;
@@ -348,12 +446,55 @@ public class ChatHandler {
             return;
         }
 
-        // Execute as console (full permissions) — safe commands only reach here
+        // Execute as console (full permissions)
         world.getServer().getCommandManager().parseAndExecute(
             world.getServer().getCommandSource(), cmd);
 
         player.sendMessage(ChatFormatter.action(config,
             "§7/" + cmd + "  " + (zh ? "§8✓" : "§8✓")), false);
+    }
+
+    /**
+     * Replaces bare ~ (tilde) coordinates with robot coordinates so commands
+     * like /fill ~ ~ ~ ~5 ~3 ~5 work when executed from server console.
+     * Coordinates cycle: x, y, z, x, y, z...
+     */
+    private static String resolveTildeCoords(String cmd, String rx, String ry, String rz) {
+        int coordAxis = 0; // 0=x, 1=y, 2=z
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < cmd.length()) {
+            if (cmd.charAt(i) == '~') {
+                int j = i + 1;
+                int offset = 0;
+                boolean hasOffset = false;
+                boolean negative = false;
+                if (j < cmd.length() && cmd.charAt(j) == '-') {
+                    negative = true;
+                    j++;
+                }
+                while (j < cmd.length() && Character.isDigit(cmd.charAt(j))) {
+                    offset = offset * 10 + (cmd.charAt(j) - '0');
+                    hasOffset = true;
+                    j++;
+                }
+                if (negative) offset = -offset;
+
+                int base = switch (coordAxis) {
+                    case 0 -> Integer.parseInt(rx);
+                    case 1 -> Integer.parseInt(ry);
+                    default -> Integer.parseInt(rz);
+                };
+                result.append(base + offset);
+
+                coordAxis = (coordAxis + 1) % 3;
+                i = j;
+            } else {
+                result.append(cmd.charAt(i));
+                i++;
+            }
+        }
+        return result.toString();
     }
 
     // ======================================================================
@@ -371,12 +512,14 @@ public class ChatHandler {
 
         String[][] en = {
             {"help",          "Show this help menu"},
+            {"status",        "Show robot status (health, mode, inventory)"},
             {"generate",      "Spawn an AI robot (one per world)"},
             {"clear",         "Clear conversation context"},
+            {"reload",        "Reload config from disk"},
             {"provider [name]","Switch AI provider (deepseek, openai, claude, etc.)"},
             {"model [name]",  "Switch AI model for current provider"},
             {"remember <f>",  "Ask AI to remember something forever"},
-            {"memories",      "List all memories"},
+            {"memories [p]",  "List all memories (optional page number)"},
             {"memory search <q>", "Search memories by keyword"},
             {"memory update <id> <c>", "Update a memory"},
             {"memory importance <id> <1-5>", "Set memory importance"},
@@ -398,12 +541,14 @@ public class ChatHandler {
         };
         String[][] zhEntries = {
             {"help",            "显示此帮助菜单"},
+            {"status",          "查看机器人状态（血量/模式/背包）"},
             {"generate",        "生成 AI 机器人（每世界一个）"},
             {"clear",           "清除对话上下文"},
+            {"reload",          "从磁盘重新加载配置"},
             {"provider [名称]",  "切换 AI 提供商 (deepseek, openai, claude, gemini 等)"},
             {"model [名称]",     "切换当前提供商的 AI 模型"},
             {"remember <内容>",  "让 AI 永久记住某件事"},
-            {"memories",        "列出所有记忆"},
+            {"memories [页码]",  "列出所有记忆（可选页码）"},
             {"memory search <关键词>", "按关键词搜索记忆"},
             {"memory update <id> <内容>", "更新一条记忆"},
             {"memory importance <id> <1-5>", "设置记忆重要性"},
@@ -451,6 +596,68 @@ public class ChatHandler {
             zh ? "API Key" : "API Key", "§7config/robot-ai.json"), false);
         player.sendMessage(ChatFormatter.entry(
             zh ? "切换提供商" : "Switch Provider", "§d/bot provider <name>"), false);
+        player.sendMessage(ChatFormatter.divider(), false);
+    }
+
+    private static void handleStatus(ServerPlayerEntity player, BotConfig config, RobotEntity robot) {
+        boolean zh = zh(config);
+        player.sendMessage(ChatFormatter.divider(), false);
+        player.sendMessage(ChatFormatter.title(zh ? "AI-Bot 状态" : "AI-Bot Status"), false);
+        player.sendMessage(ChatFormatter.blank(), false);
+
+        if (robot == null) {
+            player.sendMessage(ChatFormatter.error(config,
+                zh ? "未找到机器人。使用 §d/bot generate §7生成" : "No robot found. Use §d/bot generate"), false);
+            player.sendMessage(ChatFormatter.divider(), false);
+            return;
+        }
+
+        // Mode
+        String modeDisplay = switch (robot.getMode()) {
+            case FOLLOW -> "§a" + (zh ? "跟随" : "Follow");
+            case STAY   -> "§7" + (zh ? "待机" : "Stay");
+            case COMBAT -> "§c" + (zh ? "战斗" : "Combat");
+            case BUILD  -> "§6" + (zh ? "建造" : "Building");
+            case MINE   -> "§e" + (zh ? "挖掘" : "Mining");
+        };
+        player.sendMessage(ChatFormatter.entry(zh ? "模式" : "Mode", modeDisplay), false);
+        player.sendMessage(ChatFormatter.entry(zh ? "位置" : "Position",
+            robot.getBlockPos().getX() + ", " + robot.getBlockPos().getY() + ", " + robot.getBlockPos().getZ()), false);
+        player.sendMessage(ChatFormatter.entry(zh ? "距离" : "Distance",
+            String.format("%.1f", robot.distanceTo(player)) + (zh ? " 格" : " blocks")), false);
+
+        // Health bar
+        int hp = (int) robot.getHealth();
+        int maxHp = (int) robot.getMaxHealth();
+        int hpBar = 10;
+        int hpFilled = maxHp > 0 ? hp * hpBar / maxHp : 0;
+        String hpBarStr = "§c" + "█".repeat(hpFilled) + "§8" + "░".repeat(hpBar - hpFilled);
+        player.sendMessage(ChatFormatter.entry(zh ? "生命" : "Health",
+            "[" + hpBarStr + "§r] §f" + hp + "/" + maxHp), false);
+
+        // Hunger
+        if (config.isHungerEnabled()) {
+            int hunger = robot.getHungerLevel();
+            int hungerBar = hunger * 10 / 20;
+            String hungerBarStr = "§6" + "█".repeat(hungerBar) + "§8" + "░".repeat(10 - hungerBar);
+            player.sendMessage(ChatFormatter.entry(zh ? "饱食" : "Hunger",
+                "[" + hungerBarStr + "§r] §f" + hunger + "/20"), false);
+        }
+
+        // Inventory slots used
+        var inv = robot.getInventory();
+        int usedSlots = 0;
+        for (int i = 0; i < inv.size(); i++) {
+            if (!inv.getStack(i).isEmpty()) usedSlots++;
+        }
+        player.sendMessage(ChatFormatter.entry(zh ? "背包" : "Inventory",
+            "§f" + usedSlots + "§7/§f27 " + (zh ? "格已用" : "slots used")), false);
+
+        // Provider
+        player.sendMessage(ChatFormatter.entry(zh ? "AI模型" : "AI Model",
+            "§d" + config.getModelDisplayName()), false);
+
+        player.sendMessage(ChatFormatter.blank(), false);
         player.sendMessage(ChatFormatter.divider(), false);
     }
 
@@ -545,7 +752,7 @@ public class ChatHandler {
         }
     }
 
-    private static void handleListMemories(ServerPlayerEntity player, BotConfig config) {
+    private static void handleListMemories(ServerPlayerEntity player, BotConfig config, int page) {
         ServerWorld world = (ServerWorld) player.getEntityWorld();
         List<String> memories = MemoryManager.listMemories(world, player.getUuid());
         if (memories.isEmpty()) {
@@ -553,18 +760,30 @@ public class ChatHandler {
                 zh(config) ? "暂无记忆。用 §d/bot remember <内容> §7来添加" : "No memories yet. Use §d/bot remember <fact> §7to add"), false);
             return;
         }
+
+        final int PAGE_SIZE = 10;
+        int totalPages = (memories.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        page = Math.max(1, Math.min(page, totalPages));
+        int start = (page - 1) * PAGE_SIZE;
+        int end = Math.min(start + PAGE_SIZE, memories.size());
+
         player.sendMessage(ChatFormatter.divider(), false);
         player.sendMessage(ChatFormatter.title(
-            zh(config) ? "记忆列表 §7(" + memories.size() + ")" : "Memories §7(" + memories.size() + ")"), false);
+            zh(config) ? "记忆列表 §7(" + memories.size() + " 条，第 " + page + "/" + totalPages + " 页)"
+                       : "Memories §7(" + memories.size() + " total, page " + page + "/" + totalPages + ")"), false);
         player.sendMessage(ChatFormatter.blank(), false);
-        for (String m : memories) {
-            player.sendMessage(Text.literal("  " + m), false);
+        for (int i = start; i < end; i++) {
+            player.sendMessage(Text.literal("  " + memories.get(i)), false);
         }
         player.sendMessage(ChatFormatter.blank(), false);
-        player.sendMessage(ChatFormatter.divider(), false);
+        if (totalPages > 1) {
+            player.sendMessage(ChatFormatter.info(config,
+                zh(config) ? "§7翻页: §d/bot memories <页码>" : "§7Page: §d/bot memories <page>"), false);
+        }
         player.sendMessage(ChatFormatter.info(config,
-            zh(config) ? "§7提示: §d/bot memory search <关键词> §7搜索  §d/bot memory update <id> <内容> §7更新  §d/bot memory clear §7清除全部"
-            : "§7Tip: §d/bot memory search <query> §7search  §d/bot memory update <id> <new> §7update  §d/bot memory clear §7clear all"), false);
+            zh(config) ? "§7提示: §d/bot memory search <关键词> §7搜索  §d/bot memory clear §7清除全部"
+            : "§7Tip: §d/bot memory search <query> §7search  §d/bot memory clear §7clear all"), false);
+        player.sendMessage(ChatFormatter.divider(), false);
     }
 
     private static void handleMemorySearch(ServerPlayerEntity player, BotConfig config, String query) {

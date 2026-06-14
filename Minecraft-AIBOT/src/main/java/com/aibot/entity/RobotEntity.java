@@ -44,6 +44,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
+import net.minecraft.world.Heightmap;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
@@ -56,7 +57,7 @@ public class RobotEntity extends PathAwareEntity {
 
     // --- Static reference cache (fallback when chunk unloads) ---
     /** Cached reference to the most recent robot instance. Used as fallback in findRobotInWorld(). */
-    public static java.lang.ref.WeakReference<RobotEntity> cachedRef;
+    public static java.lang.ref.SoftReference<RobotEntity> cachedRef;
 
     /** Convenience getter for the cached robot instance. */
     @Nullable
@@ -86,6 +87,7 @@ public class RobotEntity extends PathAwareEntity {
     // --- Proactive chat ---
     private int proactiveChatTimer = 0;
     private int proactiveChatInterval = 6000; // ticks (5 min)
+    private int combatChatterCooldown = 0; // prevent spamming during combat
 
     // --- Building state ---
     private List<HouseBuilder.BuildStep> currentBuild = null;
@@ -100,11 +102,15 @@ public class RobotEntity extends PathAwareEntity {
     private String buildSize = null;
     private String buildMaterial = null;
     private int buildMissingWaitTicks = 0;
+    private int buildResumeAttempts = 0; // guard against infinite resume loops
 
     public RobotEntity(EntityType<? extends PathAwareEntity> entityType, World world) {
         super(entityType, world);
         if (!world.isClient()) {
-            cachedRef = new java.lang.ref.WeakReference<>(this);
+            cachedRef = new java.lang.ref.SoftReference<>(this);
+            // Show name tag above the robot at all times
+            this.setCustomName(Text.literal("§8[§d✦§8] §5AI-Bot"));
+            this.setCustomNameVisible(true);
         }
     }
 
@@ -118,6 +124,8 @@ public class RobotEntity extends PathAwareEntity {
 
     @Override
     protected void initGoals() {
+        BotConfig cfg = BotConfig.load();
+
         // Priority 0: urgent survival (swim, panic)
         this.goalSelector.add(0, new SwimGoal(this));
 
@@ -125,7 +133,9 @@ public class RobotEntity extends PathAwareEntity {
         this.goalSelector.add(1, new LookAtEntityGoal(this, PlayerEntity.class, 8.0F));
 
         // Priority 2: AI-driven combat with strafing (no friendly fire)
-        this.goalSelector.add(2, new AICombatGoal(this, 1.0D));
+        if (cfg.isCombatEnabled()) {
+            this.goalSelector.add(2, new AICombatGoal(this, 1.0D));
+        }
 
         // Priority 3: follow owner
         this.goalSelector.add(3, new FollowOwnerGoal(this, 1.3D, 4.0F, 2.0F));
@@ -134,13 +144,17 @@ public class RobotEntity extends PathAwareEntity {
         this.goalSelector.add(4, new ExecuteActionGoal(this));
 
         // Priority 5: collect nearby items
-        this.goalSelector.add(5, new CollectItemsGoal(this, BotConfig.load().getAutoCollectRange()));
+        if (cfg.isAutoCollectEnabled()) {
+            this.goalSelector.add(5, new CollectItemsGoal(this, cfg.getAutoCollectRange()));
+        }
 
         // Priority 6: wander around
         this.goalSelector.add(6, new WanderAroundFarGoal(this, 0.8D));
 
         // Targeting: hostile mobs (AI-prioritized)
-        this.targetSelector.add(1, new AITargetGoal(this));
+        if (cfg.isCombatEnabled()) {
+            this.targetSelector.add(1, new AITargetGoal(this));
+        }
     }
 
     public static DefaultAttributeContainer.Builder createRobotAttributes() {
@@ -160,6 +174,9 @@ public class RobotEntity extends PathAwareEntity {
         super.tick();
 
         if (!this.getEntityWorld().isClient()) {
+            // Load config once per tick (not per-call) to avoid repeated file I/O
+            BotConfig cfg = BotConfig.load();
+
             // Persist robot position every ~5 seconds (survives chunk unloads)
             if (this.age % 100 == 0) {
                 RobotWorldData data = RobotWorldData.getOrCreate((ServerWorld) this.getEntityWorld());
@@ -172,7 +189,7 @@ public class RobotEntity extends PathAwareEntity {
             tickBuilding();
 
             // Hunger system
-            if (BotConfig.load().isHungerEnabled() && hungerCooldown <= 0) {
+            if (cfg.isHungerEnabled() && hungerCooldown <= 0) {
                 hungerCooldown = 200; // ~10 seconds
                 int hunger = getHungerLevel();
                 if (hunger > 0) {
@@ -196,10 +213,9 @@ public class RobotEntity extends PathAwareEntity {
             }
 
             // Try to eat if hungry and food available
-            if (BotConfig.load().isHungerEnabled() && getHungerLevel() < 15 && this.age % 100 == 0) {
+            if (cfg.isHungerEnabled() && getHungerLevel() < 15 && this.age % 100 == 0) {
                 tryEatFood();
             }
-            // Auto-eat when health is low (survival healing)
 
             // Reset sprint when idle
             if (this.isSprinting() && this.getNavigation().isIdle()
@@ -211,14 +227,24 @@ public class RobotEntity extends PathAwareEntity {
             }
 
             // ── Proactive chat ──
-            BotConfig cfg = BotConfig.load();
-            if (cfg.isProactiveChatEnabled() && actionQueue.isEmpty()) {
+            if (cfg.isProactiveChatEnabled()) {
                 int interval = Math.max(1200, cfg.getProactiveChatInterval() * 20); // min 60s
-                if (proactiveChatTimer <= 0) {
-                    proactiveChatTimer = interval;
-                    triggerProactiveChat();
-                } else {
-                    proactiveChatTimer--;
+                // Count down combat chatter cooldown
+                if (combatChatterCooldown > 0) combatChatterCooldown--;
+
+                // Event-based chatter: react to entering combat (not just idle)
+                if (this.getMode() == RobotMode.COMBAT && this.getTarget() != null
+                    && combatChatterCooldown <= 0) {
+                    combatChatterCooldown = 600; // 30s combat chatter cooldown
+                    triggerEventChat("combat", "Engaging " + this.getTarget().getName().getString());
+                } else if (actionQueue.isEmpty()) {
+                    // Normal idle proactive chat
+                    if (proactiveChatTimer <= 0) {
+                        proactiveChatTimer = interval;
+                        triggerProactiveChat();
+                    } else {
+                        proactiveChatTimer--;
+                    }
                 }
             }
         } else {
@@ -629,13 +655,54 @@ public class RobotEntity extends PathAwareEntity {
 
     /**
      * Start building a structure. Generates the build plan and begins placement.
+     * Searches nearby for a flat area to avoid building on steep terrain.
+     * If the structure type doesn't match a template, tries custom generation.
+     * If the AI also sent commands, executes them for custom detail work.
      */
     private void startBuilding(RobotAI.QueuedAction action) {
-        // Find a flat area: use the block in front of the robot as the build origin
-        BlockPos origin = this.getBlockPos();
+        // Try to find flat terrain within 10 blocks
+        BlockPos origin = findFlatTerrain(this.getBlockPos(), 10);
+        if (origin == null) origin = this.getBlockPos(); // fallback to current position
 
-        // Clear a small area around the origin
+        // First: try the named structure
         currentBuild = HouseBuilder.generate(action.structure(), action.size(), action.material(), origin);
+
+        // Second: if no match, try custom generation from description
+        if ((currentBuild == null || currentBuild.isEmpty()) && action.description() != null) {
+            currentBuild = HouseBuilder.generateCustom(action.description(), action.size(), action.material(), origin);
+        }
+
+        // Third: if still no plan, this is a fully custom build — use commands only
+        if (currentBuild == null || currentBuild.isEmpty()) {
+            // Execute any commands the AI sent (custom builds via /fill, etc.)
+            if (action.commands() != null && !action.commands().isEmpty()) {
+                ServerWorld world = (ServerWorld) this.getEntityWorld();
+                PlayerEntity owner = getOwner();
+                int successCount = 0;
+                for (String cmd : action.commands()) {
+                    if (cmd != null && !cmd.isBlank()) {
+                        executeBuildCommand(world, owner, cmd);
+                        successCount++;
+                    }
+                }
+                if (owner != null) {
+                    if (successCount > 0) {
+                        owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §a✅ 自定义建造完成 §7(已执行 "
+                            + successCount + " 条指令)"), false);
+                    } else {
+                        owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §c⚠ 建造失败：没有可执行的指令"), false);
+                    }
+                }
+            } else if (getOwner() != null) {
+                // No template matched and no commands provided — tell the player
+                getOwner().sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §c⚠ 无法生成建造方案：结构类型「"
+                    + (action.structure() != null ? action.structure() : "未知")
+                    + "」不支持，且未提供建造指令"), false);
+                getOwner().sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7💡 尝试使用更具体的描述，或使用 §d/bot §7+ 具体指令"), false);
+            }
+            return;
+        }
+
         buildIndex = 0;
         buildCooldown = 0;
         buildOrigin = origin;
@@ -646,10 +713,17 @@ public class RobotEntity extends PathAwareEntity {
         buildSize = action.size();
         buildMaterial = action.material();
         buildMissingWaitTicks = 0;
+        buildResumeAttempts = 0;
 
-        if (currentBuild.isEmpty()) {
-            currentBuild = null;
-            return;
+        // Execute any supplementary commands (custom details on top of template)
+        if (action.commands() != null && !action.commands().isEmpty()) {
+            ServerWorld world = (ServerWorld) this.getEntityWorld();
+            PlayerEntity owner = getOwner();
+            for (String cmd : action.commands()) {
+                if (cmd != null && !cmd.isBlank()) {
+                    executeBuildCommand(world, owner, cmd);
+                }
+            }
         }
 
         // Set mode to BUILD so the robot doesn't wander
@@ -658,7 +732,118 @@ public class RobotEntity extends PathAwareEntity {
 
         System.out.println("[AIBot] Started building " + action.structure()
             + " (" + action.size() + ", " + action.material() + ")"
+            + " at " + origin.toShortString()
             + " — " + currentBuild.size() + " blocks");
+    }
+
+    /**
+     * Executes a Minecraft command for building purposes.
+     * Uses the robot's command source so ~ coordinates resolve relative to the robot.
+     * Handles coordinate placeholders: ~x~, ~y~, ~z~ = robot position.
+     */
+    private void executeBuildCommand(ServerWorld world, PlayerEntity owner, String cmdLine) {
+        if (world == null || world.getServer() == null || cmdLine == null || cmdLine.isBlank()) return;
+
+        String playerName = owner != null ? owner.getName().getString() : "@p";
+        String cmd = cmdLine.replace("@p", playerName);
+
+        // Resolve ~ coordinates relative to robot position
+        cmd = resolveTildeCoords(cmd,
+            String.valueOf((int) this.getX()),
+            String.valueOf((int) this.getY()),
+            String.valueOf((int) this.getZ()));
+
+        // Security check
+        String cmdLower = cmd.toLowerCase().trim();
+        String commandName = cmdLower.contains(" ") ? cmdLower.substring(0, cmdLower.indexOf(' ')) : cmdLower;
+        if (java.util.Set.of("op", "deop", "ban", "ban-ip", "kick", "stop", "restart",
+            "tp", "teleport").contains(commandName)) {
+            System.err.println("[AIBot] BLOCKED dangerous build command: /" + cmd);
+            return;
+        }
+
+        // Execute as console
+        world.getServer().getCommandManager().parseAndExecute(
+            world.getServer().getCommandSource(), cmd);
+    }
+
+    /**
+     * Replaces bare ~ (tilde) coordinates with absolute coords so commands like
+     * /fill ~ ~ ~ ~5 ~3 ~5 work when executed from server console.
+     */
+    private static String resolveTildeCoords(String cmd, String rx, String ry, String rz) {
+        int coordAxis = 0;
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < cmd.length()) {
+            if (cmd.charAt(i) == '~') {
+                int j = i + 1;
+                int offset = 0;
+                boolean negative = false;
+                if (j < cmd.length() && cmd.charAt(j) == '-') {
+                    negative = true;
+                    j++;
+                }
+                while (j < cmd.length() && Character.isDigit(cmd.charAt(j))) {
+                    offset = offset * 10 + (cmd.charAt(j) - '0');
+                    j++;
+                }
+                if (negative) offset = -offset;
+
+                int base = switch (coordAxis) {
+                    case 0 -> Integer.parseInt(rx);
+                    case 1 -> Integer.parseInt(ry);
+                    default -> Integer.parseInt(rz);
+                };
+                result.append(base + offset);
+
+                coordAxis = (coordAxis + 1) % 3;
+                i = j;
+            } else {
+                result.append(cmd.charAt(i));
+                i++;
+            }
+        }
+        return result.toString();
+    }
+
+    /**
+     * Searches for a reasonably flat 5×5 area within the given radius.
+     * Returns null if no flat area is found.
+     */
+    @Nullable
+    private BlockPos findFlatTerrain(BlockPos center, int radius) {
+        ServerWorld world = (ServerWorld) this.getEntityWorld();
+        int bestScore = Integer.MAX_VALUE;
+        BlockPos bestPos = null;
+
+        for (int dx = -radius; dx <= radius; dx += 2) {
+            for (int dz = -radius; dz <= radius; dz += 2) {
+                BlockPos candidate = new BlockPos(center.getX() + dx, center.getY(), center.getZ() + dz);
+                // Find actual ground level at this XZ
+                BlockPos ground = world.getTopPosition(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, candidate);
+
+                // Check the 5×5 area around this candidate for height variance
+                int minY = Integer.MAX_VALUE;
+                int maxY = Integer.MIN_VALUE;
+                for (int sx = -2; sx <= 2; sx++) {
+                    for (int sz = -2; sz <= 2; sz++) {
+                        BlockPos sample = new BlockPos(ground.getX() + sx, ground.getY(), ground.getZ() + sz);
+                        BlockPos top = world.getTopPosition(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, sample);
+                        minY = Math.min(minY, top.getY());
+                        maxY = Math.max(maxY, top.getY());
+                    }
+                }
+                int variance = maxY - minY;
+                if (variance < bestScore) {
+                    bestScore = variance;
+                    bestPos = ground;
+                    if (variance == 0) return bestPos; // perfectly flat
+                }
+            }
+        }
+        // Accept if variance is <= 2 blocks
+        return bestScore <= 2 ? bestPos : null;
     }
 
     /**
@@ -670,14 +855,24 @@ public class RobotEntity extends PathAwareEntity {
         if (this.getMode() != RobotMode.BUILD) return;
         if (currentBuild == null || buildIndex >= currentBuild.size()) {
             // Building complete or no build in progress
-            if (currentBuild != null) {
+            if (currentBuild != null && buildIndex >= currentBuild.size()) {
                 PlayerEntity owner = getOwner();
                 System.out.println("[AIBot] Building complete! Placed " + buildIndex + " blocks.");
                 if (owner != null) {
-                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §a建造完成 ✓ §7(共 "
-                        + buildIndex + " 块)"), false);
+                    String structName = buildStructure != null && !buildStructure.isBlank()
+                        ? buildStructure : "custom";
+                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §a✅ 建造完成！ §7「"
+                        + structName + "」共 " + buildIndex + " 块"), false);
                 }
                 clearBuildState(RobotMode.FOLLOW);
+            } else if (currentBuild == null) {
+                // Stuck in BUILD mode with no build plan — reset
+                System.err.println("[AIBot] Stuck in BUILD mode with null build plan — resetting");
+                clearBuildState(RobotMode.FOLLOW);
+                PlayerEntity owner = getOwner();
+                if (owner != null) {
+                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §e⚠ 建造状态已重置（无建造计划）"), false);
+                }
             }
             return;
         }
@@ -693,54 +888,80 @@ public class RobotEntity extends PathAwareEntity {
         int totalBlocks = currentBuild.size();
         PlayerEntity owner = getOwner();
 
-        // Survival mode: find and consume the matching block from inventory
-        Block targetBlock = step.state().getBlock();
-        int foundSlot = -1;
-        for (int i = 0; i < inventory.size(); i++) {
-            ItemStack stack = inventory.getStack(i);
-            if (!stack.isEmpty() && stack.getItem() instanceof BlockItem bi) {
-                if (bi.getBlock() == targetBlock) {
-                    foundSlot = i;
-                    break;
-                }
-            }
-        }
+        // ⭐ CREATIVE MODE CHECK: If owner is in creative, place blocks freely!
+        boolean ownerIsCreative = owner != null && owner.isCreative();
 
-        if (foundSlot >= 0) {
-            // Consume one block from inventory and place
-            ItemStack stack = inventory.getStack(foundSlot);
-            stack.decrement(1);
+        if (ownerIsCreative) {
+            // Creative mode: place block directly without consuming inventory
             world.setBlockState(step.pos(), step.state());
             buildIndex++;
             buildMissingWarningSent = false;
+            buildCooldown = 1; // fast placement in creative
         } else {
-            // ⚠️  Material missing — pause and wait (never consume wrong blocks as fallback — survival dupe bug)
-            if (!buildMissingWarningSent && owner != null) {
-                String blockName = targetBlock.getName().getString();
-                owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §e缺少材料：需要 「"
-                    + blockName + "」§7，放材料到我的背包后我会继续"), false);
-                buildMissingWarningSent = true;
-                buildMissingWaitTicks = 0;
-            } else if (owner != null) {
-                buildMissingWaitTicks++;
-                if (buildMissingWaitTicks > 200) {
-                    String blockName = targetBlock.getName().getString();
-                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §e仍在等待材料：「"
-                        + blockName + "」"), false);
-                    buildMissingWaitTicks = 0;
+            // Survival mode: find and consume the matching block from inventory
+            Block targetBlock = step.state().getBlock();
+            int foundSlot = -1;
+            for (int i = 0; i < inventory.size(); i++) {
+                ItemStack stack = inventory.getStack(i);
+                if (!stack.isEmpty() && stack.getItem() instanceof BlockItem bi) {
+                    if (bi.getBlock() == targetBlock) {
+                        foundSlot = i;
+                        break;
+                    }
                 }
             }
-            // DO NOT increment buildIndex — retry same block next tick
-            buildCooldown = 20;
-            return;
-        }
 
-        buildCooldown = 1;
+            if (foundSlot >= 0) {
+                // Consume one block from inventory and place
+                ItemStack stack = inventory.getStack(foundSlot);
+                stack.decrement(1);
+                world.setBlockState(step.pos(), step.state());
+                buildIndex++;
+                buildMissingWarningSent = false;
+                buildMissingWaitTicks = 0; // reset wait counter on success
+            } else {
+                // ⚠️  Material missing — pause and wait (never consume wrong blocks as fallback — survival dupe bug)
+                buildMissingWaitTicks++;
+                if (!buildMissingWarningSent && owner != null) {
+                    String blockName = targetBlock.getName().getString();
+                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §e⚠ 缺少材料：「"
+                        + blockName + "」§7，放入我的背包后自动继续"), false);
+                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7💡 进度: "
+                        + buildIndex + "/" + totalBlocks + " §8("
+                        + (buildIndex * 100 / Math.max(1, totalBlocks)) + "%)"), false);
+                    buildMissingWarningSent = true;
+                } else if (owner != null && buildMissingWaitTicks > 200 && buildMissingWaitTicks % 200 == 0) {
+                    String blockName = targetBlock.getName().getString();
+                    owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §e⏳ 仍在等待：「"
+                        + blockName + "」§7(已等待 " + (buildMissingWaitTicks / 20) + " 秒)"), false);
+                }
+                // ⏱️ TIMEOUT: after 60 seconds of waiting, give up and tell the player
+                if (buildMissingWaitTicks > 1200) {
+                    if (owner != null) {
+                        String blockName = targetBlock.getName().getString();
+                        owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §c⏰ 等待超时（60秒），建造中止。缺少：「"
+                            + blockName + "」"), false);
+                        owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7💡 已放置 " + buildIndex + "/" + totalBlocks
+                            + " 块，补充材料后输入建造指令继续"), false);
+                    }
+                    clearBuildState(RobotMode.FOLLOW);
+                    return;
+                }
+                // DO NOT increment buildIndex — retry same block next tick
+                buildCooldown = 20;
+                return;
+            }
+
+            buildCooldown = 1;
+        }
 
         // ── Progress report every ~10 blocks ──
         if (buildIndex - buildLastReportIndex >= 10 && owner != null) {
             int pct = buildIndex * 100 / Math.max(1, totalBlocks);
-            owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7🏗️ 建造中… §d"
+            int barWidth = 10;
+            int filled = Math.min(barWidth, buildIndex * barWidth / Math.max(1, totalBlocks));
+            String bar = "§a" + "█".repeat(filled) + "§8" + "░".repeat(barWidth - filled);
+            owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7建造中 [" + bar + "§7] §d"
                 + buildIndex + "§7/§d" + totalBlocks + " §8(" + pct + "%)"), false);
             buildLastReportIndex = buildIndex;
         }
@@ -763,6 +984,7 @@ public class RobotEntity extends PathAwareEntity {
         buildSkippedCount = 0;
         buildMissingWarningSent = false;
         buildMissingWaitTicks = 0;
+        buildResumeAttempts = 0;
         // NOTE: buildStructure/buildSize/buildMaterial are NOT cleared
         // so the build can be resumed later with "resume" or same params
         setMode(newMode);
@@ -770,9 +992,24 @@ public class RobotEntity extends PathAwareEntity {
 
     /**
      * Resumes a previous interrupted build if parameters were saved.
+     * Gives up after 3 failed attempts to prevent infinite loops.
      */
     private boolean tryResumeBuild() {
         if (buildStructure == null || buildOrigin == null) return false;
+        buildResumeAttempts++;
+        if (buildResumeAttempts > 3) {
+            // Give up resuming — world was modified too much
+            PlayerEntity owner = getOwner();
+            if (owner != null) {
+                owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §c⚠ 恢复建造失败（已尝试 "
+                    + buildResumeAttempts + " 次），世界变动过大"), false);
+                owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7💡 请使用新的建造指令重新开始"), false);
+            }
+            buildStructure = null;
+            buildResumeAttempts = 0;
+            clearBuildState(RobotMode.FOLLOW);
+            return false;
+        }
         currentBuild = HouseBuilder.generate(buildStructure, buildSize, buildMaterial, buildOrigin);
         if (currentBuild == null || currentBuild.isEmpty()) {
             currentBuild = null;
@@ -794,16 +1031,58 @@ public class RobotEntity extends PathAwareEntity {
         buildLastReportIndex = buildIndex;
         buildSkippedCount = 0;
         buildMissingWarningSent = false;
+        buildResumeAttempts = 0;
         setMode(RobotMode.BUILD);
         PlayerEntity owner = getOwner();
         if (owner != null) {
-            owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §7恢复建造：第 "
-                + (buildIndex + 1) + " / " + currentBuild.size() + " 块"), false);
+            int remaining = currentBuild.size() - buildIndex;
+            owner.sendMessage(Text.literal("§8[§d✦ §5AI-Bot§8] §a🔄 建造已恢复！剩余 "
+                + remaining + " 块 §7(第 " + (buildIndex + 1) + "/" + currentBuild.size() + " 块)"), false);
         }
         return buildIndex < currentBuild.size();
     }
 
     // ==================== Proactive Chat ====================
+
+    /**
+     * Triggers a quick event-driven chat (combat, discovery, task completion).
+     * Bypasses the normal proactive timer so the robot reacts immediately.
+     */
+    private void triggerEventChat(String event, String context) {
+        PlayerEntity owner = getOwner();
+        if (owner == null) return;
+        BotConfig config = BotConfig.load();
+        if (!config.hasApiKey()) return;
+
+        boolean zh = config.getCommandLanguage().equals("zh");
+        String prompt = switch (event) {
+            case "combat" -> zh
+                ? "你正在战斗，说一句简短的战斗口号或提醒玩家注意安全（1句话）。返回格式：{\"actions\":[{\"type\":\"chat\",\"message\":\"...\"}]}"
+                : "You just entered combat. Say a short battle cry or warn the player. 1 sentence. Return: {\"actions\":[{\"type\":\"chat\",\"message\":\"...\"}]}";
+            default -> zh
+                ? "说一句话回应当前情况：" + context + "。1句话。返回格式：{\"actions\":[{\"type\":\"chat\",\"message\":\"...\"}]}"
+                : "Say one sentence reacting to: " + context + ". Return: {\"actions\":[{\"type\":\"chat\",\"message\":\"...\"}]}";
+        };
+
+        com.aibot.ai.DeepSeekClient.sendProactiveChat(owner, prompt, this)
+            .thenAcceptAsync(response -> {
+                if (response != null && !response.isEmpty()) {
+                    var parsed = com.aibot.ai.CommandParser.parse(response);
+                    for (var a : parsed) {
+                        if (a.type == com.aibot.ai.ActionTypes.CHAT && a.message != null) {
+                            String safeMsg = com.aibot.chat.ChatFormatter.stripFormatCodes(a.message);
+                            owner.sendMessage(com.aibot.chat.ChatFormatter.msg(config, "§7" + safeMsg), false);
+                            return;
+                        }
+                    }
+                }
+            }, runnable -> {
+                var w = this.getEntityWorld();
+                if (w instanceof ServerWorld sw && sw.getServer() != null) {
+                    sw.getServer().execute(runnable);
+                }
+            });
+    }
 
     /**
      * Triggers a proactive chat message. Uses AI if available, otherwise falls back
@@ -834,15 +1113,17 @@ public class RobotEntity extends PathAwareEntity {
                             var parsed = com.aibot.ai.CommandParser.parse(response);
                             for (var a : parsed) {
                                 if (a.type == com.aibot.ai.ActionTypes.CHAT && a.message != null) {
+                                    String safeMsg = com.aibot.chat.ChatFormatter.stripFormatCodes(a.message);
                                     owner.sendMessage(com.aibot.chat.ChatFormatter.msg(config,
-                                        "§7" + a.message), false);
+                                        "§7" + safeMsg), false);
                                     return;
                                 }
                             }
                         }
                         if (!msg.equals("{}") && !msg.startsWith("{\"actions")) {
+                            String safeMsg = com.aibot.chat.ChatFormatter.stripFormatCodes(msg);
                             owner.sendMessage(com.aibot.chat.ChatFormatter.msg(config,
-                                "§7" + msg), false);
+                                "§7" + safeMsg), false);
                         }
                     }
                 }, runnable -> {
@@ -940,13 +1221,13 @@ public class RobotEntity extends PathAwareEntity {
     }
 
     protected void loot(ItemEntity item) {
-        // Pick up item into robot's inventory
         ItemStack itemStack = item.getStack();
         if (!itemStack.isEmpty() && this.canPickUpLoot()) {
             ItemStack remainder = this.getInventory().addStack(itemStack);
             if (remainder.isEmpty()) {
                 item.discard();
             } else {
+                // Inventory full — put the remainder back on the item entity
                 item.setStack(remainder);
             }
         }
@@ -1005,12 +1286,16 @@ public class RobotEntity extends PathAwareEntity {
     // ==================== Combat ====================
 
     public boolean isInvulnerableTo(DamageSource damageSource) {
-        return true;  // Immune to ALL damage types including void, /kill, etc.
+        return true;  // Immune to all damage; hunger uses the damage() override instead
     }
 
     @Override
     public boolean damage(ServerWorld world, DamageSource source, float amount) {
-        return false;  // Robot is invulnerable — blocks all damage from any source
+        // Let starvation bypass so the hunger system can deal damage when it calls this
+        if (source.isOf(net.minecraft.entity.damage.DamageTypes.STARVE)) {
+            return super.damage(world, source, amount);
+        }
+        return false;  // All other damage blocked
     }
 
     @Override
@@ -1098,10 +1383,12 @@ public class RobotEntity extends PathAwareEntity {
                     if (BotConfig.load().isAutoToolEnabled()) {
                         robot.equipBestTool(target);
                     }
-                    // Break the block
+                    // Only break if there's actually a block there (not air)
                     ServerWorld serverWorld = (ServerWorld) robot.getEntityWorld();
-                    serverWorld.breakBlock(target, true, robot, 0);
-                    robot.playSound(SoundEvents.BLOCK_STONE_BREAK, 1.0F, 1.0F);
+                    if (!serverWorld.getBlockState(target).isAir()) {
+                        serverWorld.breakBlock(target, true, robot, 0);
+                        robot.playSound(SoundEvents.BLOCK_STONE_BREAK, 1.0F, 1.0F);
+                    }
                     // Auto-collect nearby drops after mining
                     Box dropBox = new Box(target).expand(3);
                     var drops = serverWorld.getOtherEntities(robot, dropBox,
@@ -1299,7 +1586,11 @@ public class RobotEntity extends PathAwareEntity {
         @Override
         public void tick() {
             LivingEntity target = robot.getTarget();
-            if (target == null) return;
+            if (target == null || !target.isAlive()) {
+                // Target gone — stop combat cleanly
+                robot.setTarget(null);
+                return;
+            }
 
             double distSq = robot.squaredDistanceTo(target);
             robot.getLookControl().lookAt(target, 360.0F, 60.0F);

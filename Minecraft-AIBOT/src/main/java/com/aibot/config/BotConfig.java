@@ -19,6 +19,9 @@ public class BotConfig {
     private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("robot-ai.json");
 
     private static BotConfig INSTANCE;
+    private static long instanceLoadTime = 0;
+    // Re-check the config file at most once per 30 seconds to pick up hot-reloads
+    private static final long CONFIG_CACHE_MS = 30_000;
 
     // ==================== API / AI Settings ====================
 
@@ -257,9 +260,13 @@ public class BotConfig {
 
     /**
      * Loads the config from disk, or creates a default one if it doesn't exist.
+     * Uses a 30-second in-memory cache to avoid repeated file I/O each tick.
      */
     public static BotConfig load() {
-        if (INSTANCE != null) return INSTANCE;
+        long now = System.currentTimeMillis();
+        if (INSTANCE != null && (now - instanceLoadTime) < CONFIG_CACHE_MS) {
+            return INSTANCE;
+        }
 
         if (Files.exists(CONFIG_PATH)) {
             try (Reader reader = Files.newBufferedReader(CONFIG_PATH)) {
@@ -280,6 +287,7 @@ public class BotConfig {
 
         // Always save to ensure all fields exist
         INSTANCE.save();
+        instanceLoadTime = System.currentTimeMillis();
         return INSTANCE;
     }
 
@@ -335,10 +343,11 @@ public class BotConfig {
     }
 
     /**
-     * Reloads the config from disk.
+     * Reloads the config from disk immediately (bypasses cache).
      */
     public static void reload() {
         INSTANCE = null;
+        instanceLoadTime = 0;
         load();
     }
 

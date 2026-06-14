@@ -170,6 +170,22 @@ public class CommandParser {
         if (obj.has("material")) {
             action.material = obj.get("material").getAsString();
         }
+        if (obj.has("description")) {
+            action.description = obj.get("description").getAsString();
+        }
+
+        // Parse commands array (multi-command sequences for custom builds)
+        if (obj.has("commands")) {
+            JsonArray cmds = obj.getAsJsonArray("commands");
+            action.commands = new ArrayList<>();
+            for (JsonElement e : cmds) {
+                action.commands.add(e.getAsString());
+            }
+        } else if (obj.has("command") && action.command != null) {
+            // Single command: wrap in list for uniform handling
+            action.commands = new ArrayList<>();
+            action.commands.add(action.command);
+        }
 
         // Parse position if present
         if (obj.has("position")) {

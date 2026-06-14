@@ -13,6 +13,7 @@ public class ConversationHistory {
 
     private final List<Map<String, String>> messages = new ArrayList<>();
     private int maxTokens = 4096;
+    private static final int MAX_RAW_MESSAGES = 200; // hard cap to prevent unbounded growth
 
     /** Rough estimation: 1 token ≈ 4 characters (Chinese: ~2 chars/token) */
     private static final double CHARS_PER_TOKEN = 4.0;
@@ -31,6 +32,11 @@ public class ConversationHistory {
         msg.put("role", role);
         msg.put("content", content);
         messages.add(msg);
+        // Trim raw list when it grows too large to prevent memory leak
+        if (messages.size() > MAX_RAW_MESSAGES) {
+            // Keep the first message (system) and trim oldest user/assistant turns
+            messages.subList(1, messages.size() - MAX_RAW_MESSAGES / 2).clear();
+        }
     }
 
     public void addUserMessage(String content) {

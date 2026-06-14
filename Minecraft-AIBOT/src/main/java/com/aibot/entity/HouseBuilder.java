@@ -44,8 +44,66 @@ public class HouseBuilder {
             case "platform" -> generatePlatform(size, material, origin);
             case "shelter" -> generateShelter(material, origin);
             case "road" -> generateRoad(size, material, origin);
-            default -> generateHouse(size, material, origin);
+            case "fountain" -> generateFountain(size, material, origin);
+            case "statue" -> generateStatue(size, material, origin);
+            case "pyramid" -> generatePyramid(size, material, origin);
+            case "pool" -> generatePool(size, material, origin);
+            case "garden" -> generateGarden(size, material, origin);
+            case "pillar" -> generatePillar(size, material, origin);
+            case "arch" -> generateArch(size, material, origin);
+            case "farm" -> generateFarm(size, material, origin);
+            // Unknown/unsupported structure — return empty list so caller can fall back
+            // to custom generation or command-based building
+            default -> {
+                System.out.println("[AIBot] Unknown structure type: " + structure + " — falling back to custom generation");
+                yield List.of();
+            }
         };
+    }
+
+    /**
+     * Generates a custom build based on a freeform description.
+     * Analyzes the description for shape keywords and builds accordingly.
+     * Returns empty list if no pattern matches — caller should fall back to command-based building.
+     */
+    public static List<BuildStep> generateCustom(String description, String size, String material, BlockPos origin) {
+        if (description == null || origin == null) return List.of();
+        String desc = description.toLowerCase();
+
+        // Try to match description keywords to known shapes
+        if (desc.contains("statue") || desc.contains("雕塑") || desc.contains("雕像") || desc.contains("人像")) {
+            return generateStatue(size, material, origin);
+        }
+        if (desc.contains("pyramid") || desc.contains("金字塔")) {
+            return generatePyramid(size, material, origin);
+        }
+        if (desc.contains("fountain") || desc.contains("喷泉") || desc.contains("水池")) {
+            return generateFountain(size, material, origin);
+        }
+        if (desc.contains("pool") || desc.contains("游泳池") || desc.contains("池塘")) {
+            return generatePool(size, material, origin);
+        }
+        if (desc.contains("pillar") || desc.contains("柱子") || desc.contains("柱")) {
+            return generatePillar(size, material, origin);
+        }
+        if (desc.contains("arch") || desc.contains("拱门") || desc.contains("门")) {
+            return generateArch(size, material, origin);
+        }
+        if (desc.contains("farm") || desc.contains("农场") || desc.contains("田")) {
+            return generateFarm(size, material, origin);
+        }
+        if (desc.contains("garden") || desc.contains("花园")) {
+            return generateGarden(size, material, origin);
+        }
+        if (desc.contains("wall") || desc.contains("墙")) {
+            return generateWall(size, material, origin);
+        }
+        if (desc.contains("tower") || desc.contains("塔")) {
+            return generateTower(size, material, origin);
+        }
+
+        // No match — return empty to signal fallback to command-based building
+        return List.of();
     }
 
     // ======================================================================
@@ -334,6 +392,294 @@ public class HouseBuilder {
         for (int x = 0; x < length; x++) {
             for (int z = 0; z < width; z++) {
                 addStep(steps, origin, x, 0, z, roadBlock);
+            }
+        }
+        return steps;
+    }
+
+    // ======================================================================
+    //  Fountain (water feature with decorative ring)
+    // ======================================================================
+
+    private static List<BuildStep> generateFountain(String size, String material, BlockPos origin) {
+        int radius = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 3;
+            case "large" -> 5;
+            default -> 2;
+        };
+        Block rimBlock = getBlock(material, "log", Blocks.STONE_BRICKS);
+        Block waterBlock = Blocks.WATER;
+
+        List<BuildStep> steps = new ArrayList<>();
+        // Basin: circular rim
+        for (int x = -radius; x <= radius; x++) {
+            for (int z = -radius; z <= radius; z++) {
+                double dist = Math.sqrt(x * x + z * z);
+                if (dist <= radius && dist > radius - 1) {
+                    // Rim
+                    for (int y = 0; y < 2; y++) {
+                        addStep(steps, origin, x, y, z, rimBlock);
+                    }
+                } else if (dist <= radius - 1) {
+                    // Interior: bottom slab
+                    addStep(steps, origin, x, -1, z, rimBlock);
+                    // Water on top
+                    addStep(steps, origin, x, 0, z, waterBlock);
+                }
+            }
+        }
+        // Central pillar with water source on top
+        addStep(steps, origin, 0, 0, 0, rimBlock);
+        addStep(steps, origin, 0, 1, 0, rimBlock);
+        addStep(steps, origin, 0, 2, 0, waterBlock);
+        return steps;
+    }
+
+    // ======================================================================
+    //  Statue (humanoid figure — simplified)
+    // ======================================================================
+
+    private static List<BuildStep> generateStatue(String size, String material, BlockPos origin) {
+        int scale = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 2;
+            case "large" -> 3;
+            default -> 1;
+        };
+        Block bodyBlock = getBlock(material, "log", Blocks.STONE);
+        Block headBlock = getBlock(material, "planks", Blocks.STONE_BRICKS);
+
+        List<BuildStep> steps = new ArrayList<>();
+        int bx = 0, bz = 0;
+        int baseY = 0;
+
+        // Base platform
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                addStep(steps, origin, x, baseY, z, bodyBlock);
+            }
+        }
+
+        // Legs (2 pillars)
+        for (int y = 1; y <= 2 * scale; y++) {
+            addStep(steps, origin, bx - 1, y, bz, bodyBlock);
+            addStep(steps, origin, bx + 1, y, bz, bodyBlock);
+        }
+
+        // Body (2-wide pillar up to shoulder)
+        int bodyTop = 2 * scale + 1;
+        for (int y = bodyTop; y <= bodyTop + 2 * scale; y++) {
+            addStep(steps, origin, bx, y, bz, bodyBlock);
+            if (scale > 1) {
+                addStep(steps, origin, bx, y, bz + 1, bodyBlock);
+            }
+        }
+
+        // Arms (horizontal at shoulder height)
+        int shoulderY = bodyTop + 2 * scale;
+        for (int dx = -2; dx <= 2; dx++) {
+            if (Math.abs(dx) >= 1) {
+                addStep(steps, origin, dx, shoulderY, bz, bodyBlock);
+            }
+        }
+
+        // Head
+        int headY = shoulderY + 1;
+        addStep(steps, origin, bx, headY, bz, headBlock);
+        if (scale > 1) {
+            addStep(steps, origin, bx, headY + 1, bz, headBlock);
+            addStep(steps, origin, bx + 1, headY, bz, headBlock);
+            addStep(steps, origin, bx - 1, headY, bz, headBlock);
+            addStep(steps, origin, bx, headY, bz + 1, headBlock);
+            addStep(steps, origin, bx, headY, bz - 1, headBlock);
+        }
+
+        return steps;
+    }
+
+    // ======================================================================
+    //  Pyramid (square base → apex)
+    // ======================================================================
+
+    private static List<BuildStep> generatePyramid(String size, String material, BlockPos origin) {
+        int baseSize = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 9;
+            case "large" -> 15;
+            default -> 5;
+        };
+        Block block = getBlock(material, "log", Blocks.SANDSTONE);
+
+        List<BuildStep> steps = new ArrayList<>();
+        int half = baseSize / 2;
+        for (int y = 0; y <= half; y++) {
+            int layerSize = baseSize - y * 2;
+            int offset = y;
+            for (int x = 0; x < layerSize; x++) {
+                for (int z = 0; z < layerSize; z++) {
+                    // Only place blocks on the perimeter of each layer
+                    if (x == 0 || x == layerSize - 1 || z == 0 || z == layerSize - 1 || y == 0) {
+                        addStep(steps, origin, x + offset, y, z + offset, block);
+                    }
+                }
+            }
+        }
+        return steps;
+    }
+
+    // ======================================================================
+    //  Pool (water-filled rectangular basin)
+    // ======================================================================
+
+    private static List<BuildStep> generatePool(String size, String material, BlockPos origin) {
+        int dim = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 7;
+            case "large" -> 11;
+            default -> 5;
+        };
+        Block rimBlock = getBlock(material, "log", Blocks.STONE_BRICKS);
+        Block waterBlock = Blocks.WATER;
+
+        List<BuildStep> steps = new ArrayList<>();
+        for (int x = -1; x <= dim; x++) {
+            for (int z = -1; z <= dim; z++) {
+                boolean isEdge = x == -1 || x == dim || z == -1 || z == dim;
+                if (isEdge) {
+                    // Rim
+                    for (int y = -1; y < 1; y++) {
+                        addStep(steps, origin, x, y, z, rimBlock);
+                    }
+                } else {
+                    // Interior: floor + water
+                    addStep(steps, origin, x, -1, z, rimBlock);
+                    addStep(steps, origin, x, 0, z, waterBlock);
+                }
+            }
+        }
+        return steps;
+    }
+
+    // ======================================================================
+    //  Garden (small fenced area with flowers)
+    // ======================================================================
+
+    private static List<BuildStep> generateGarden(String size, String material, BlockPos origin) {
+        int dim = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 7;
+            case "large" -> 11;
+            default -> 5;
+        };
+        Block fenceBlock = Blocks.OAK_FENCE;
+        Block grassBlock = Blocks.GRASS_BLOCK;
+        Block flowerBlock = Blocks.POPPY;
+
+        List<BuildStep> steps = new ArrayList<>();
+        for (int x = 0; x < dim; x++) {
+            for (int z = 0; z < dim; z++) {
+                boolean isEdge = x == 0 || x == dim - 1 || z == 0 || z == dim - 1;
+                if (isEdge) {
+                    // Fence posts at corners, fence between
+                    addStep(steps, origin, x, 0, z, grassBlock);
+                    addStep(steps, origin, x, 1, z, fenceBlock);
+                } else {
+                    addStep(steps, origin, x, 0, z, grassBlock);
+                    // Scatter flowers randomly (deterministic by position)
+                    if ((x + z) % 3 == 0) {
+                        addStep(steps, origin, x, 1, z, flowerBlock);
+                    }
+                }
+            }
+        }
+        return steps;
+    }
+
+    // ======================================================================
+    //  Pillar (tall single-column structure)
+    // ======================================================================
+
+    private static List<BuildStep> generatePillar(String size, String material, BlockPos origin) {
+        int height = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 12;
+            case "large" -> 20;
+            default -> 6;
+        };
+        Block pillarBlock = getBlock(material, "log", Blocks.STONE_BRICKS);
+        Block topBlock = getBlock(material, "planks", Blocks.GLOWSTONE);
+
+        List<BuildStep> steps = new ArrayList<>();
+        // Base (2x2)
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                addStep(steps, origin, x, 0, z, pillarBlock);
+            }
+        }
+        // Shaft
+        for (int y = 1; y < height; y++) {
+            addStep(steps, origin, 0, y, 0, pillarBlock);
+        }
+        // Top decoration
+        addStep(steps, origin, 0, height, 0, topBlock);
+        return steps;
+    }
+
+    // ======================================================================
+    //  Arch (free-standing archway)
+    // ======================================================================
+
+    private static List<BuildStep> generateArch(String size, String material, BlockPos origin) {
+        int archHeight = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 7;
+            case "large" -> 11;
+            default -> 5;
+        };
+        int archWidth = archHeight / 2 + 1;
+        Block archBlock = getBlock(material, "log", Blocks.STONE_BRICKS);
+
+        List<BuildStep> steps = new ArrayList<>();
+        int centerX = archWidth;
+
+        // Two side pillars
+        for (int y = 0; y < archHeight; y++) {
+            addStep(steps, origin, 0, y, 0, archBlock);
+            addStep(steps, origin, centerX * 2, y, 0, archBlock);
+        }
+        // Arch curve (semi-circle top)
+        for (int x = 1; x < centerX * 2; x++) {
+            double dx = x - centerX;
+            int curveY = archHeight - (int) Math.round(Math.sqrt(Math.max(0, centerX * centerX - dx * dx)));
+            curveY = Math.max(archHeight - centerX, curveY);
+            addStep(steps, origin, x, curveY, 0, archBlock);
+            // Extra thickness
+            addStep(steps, origin, x, curveY, 1, archBlock);
+        }
+        return steps;
+    }
+
+    // ======================================================================
+    //  Farm (tilled soil with water channels)
+    // ======================================================================
+
+    private static List<BuildStep> generateFarm(String size, String material, BlockPos origin) {
+        int farmSize = switch (size != null ? size.toLowerCase() : "small") {
+            case "medium" -> 9;
+            case "large" -> 15;
+            default -> 5;
+        };
+        Block fenceBlock = Blocks.OAK_FENCE;
+        Block dirtBlock = Blocks.DIRT;
+        Block waterBlock = Blocks.WATER;
+
+        List<BuildStep> steps = new ArrayList<>();
+        for (int x = 0; x < farmSize; x++) {
+            for (int z = 0; z < farmSize; z++) {
+                boolean isEdge = x == 0 || x == farmSize - 1 || z == 0 || z == farmSize - 1;
+                boolean isWaterChannel = (x == farmSize / 2 || z == farmSize / 2) && !isEdge;
+                if (isEdge) {
+                    addStep(steps, origin, x, 0, z, dirtBlock);
+                    addStep(steps, origin, x, 1, z, fenceBlock);
+                } else if (isWaterChannel) {
+                    addStep(steps, origin, x, 0, z, waterBlock);
+                } else {
+                    addStep(steps, origin, x, 0, z, Blocks.FARMLAND);
+                }
             }
         }
         return steps;

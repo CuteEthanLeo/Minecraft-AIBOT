@@ -20,6 +20,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -37,11 +38,15 @@ public class DeepSeekClient {
             .build();
     private static final Gson GSON = new Gson();
 
+    // Entity scan cache — prevents expensive getOtherEntities() on every command
+    private static List<Entity> cachedNearbyEntities = List.of();
+    private static long entityCacheExpiry = 0;
+
     /** Per-player conversation history (keyed by player UUID string) */
     private static final java.util.concurrent.ConcurrentHashMap<String, ConversationHistory>
             PLAYER_HISTORIES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final int MAX_HISTORY_ENTRIES = 50;
-    private static int historyCleanupCounter = 0;
+    private static final java.util.concurrent.atomic.AtomicInteger historyCleanupCounter = new java.util.concurrent.atomic.AtomicInteger(0);
 
     /**
      * Sends a player command to the DeepSeek API and returns the parsed actions.
@@ -81,22 +86,59 @@ public class DeepSeekClient {
         return HTTP_CLIENT.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     if (response.statusCode() != 200 && response.statusCode() != 201) {
-                        System.err.println("[AIBot] API error " + response.statusCode()
-                                + " (provider: " + provider + ", model: " + config.getModel() + "): " + response.body());
+                        String errMsg = "[AIBot] API error " + response.statusCode()
+                                + " (provider: " + provider + ", model: " + config.getModel() + "): "
+                                + (response.body().length() > 200 ? response.body().substring(0, 200) + "..." : response.body());
+                        System.err.println(errMsg);
+                        // Store last error for ChatHandler to display
+                        lastApiError = "API " + response.statusCode() + " error";
                         return "";
                     }
+                    lastApiError = null;
                     return extractContent(response.body(), provider);
                 })
                 .thenApply(responseText -> {
                     if (!responseText.isEmpty() && config.isConversationContext()) {
                         history.addAssistantMessage(responseText);
                     }
+                    if (responseText.isEmpty() && lastApiError != null) {
+                        // API error — return error action for player feedback
+                        List<ParsedAction> errorActions = new ArrayList<>();
+                        ParsedAction errAction = new ParsedAction();
+                        errAction.type = ActionTypes.CHAT;
+                        errAction.message = "❌ API错误: " + lastApiError + " — 请检查API Key和网络连接";
+                        errorActions.add(errAction);
+                        return errorActions;
+                    }
                     return CommandParser.parse(responseText);
                 })
                 .exceptionally(ex -> {
-                    System.err.println("[AIBot] API call failed: " + ex.getMessage());
-                    return List.of();
+                    String errMsg = "[AIBot] API call failed: " + ex.getMessage();
+                    System.err.println(errMsg);
+                    lastApiError = ex.getMessage();
+                    List<ParsedAction> errorActions = new ArrayList<>();
+                    ParsedAction errAction = new ParsedAction();
+                    errAction.type = ActionTypes.CHAT;
+                    errAction.message = "❌ API连接失败: " + ex.getMessage() + " — 请检查网络和API Key配置";
+                    errorActions.add(errAction);
+                    return errorActions;
                 });
+    }
+
+    /** Last API error message for ChatHandler to display to the player. */
+    private static volatile String lastApiError = null;
+
+    /** Whether the last API call had its conversation context trimmed due to token limits. */
+    private static volatile boolean contextWasTrimmed = false;
+
+    /** Returns the last API error message, or null if the last call succeeded. */
+    public static String getLastApiError() {
+        return lastApiError;
+    }
+
+    /** Returns true if the last API call had its conversation context trimmed. */
+    public static boolean wasContextTrimmed() {
+        return contextWasTrimmed;
     }
 
     /**
@@ -133,6 +175,9 @@ public class DeepSeekClient {
             if (fullCount > sentCount) {
                 System.out.println("[AIBot] Context trimmed: kept " + sentCount
                         + "/" + fullCount + " messages (budget: " + config.getMaxContextTokens() + " tokens)");
+                contextWasTrimmed = true; // flag for ChatHandler to notify player
+            } else {
+                contextWasTrimmed = false;
             }
         } else {
             // No context: just send the current command
@@ -152,13 +197,14 @@ public class DeepSeekClient {
 
     /**
      * Gets or creates a ConversationHistory for the given player.
+     * Uses LRU eviction instead of blanket clear to preserve other players' context.
      */
     private static ConversationHistory getHistory(String playerId, BotConfig config) {
-        // Evict stale entries every 16 accesses to prevent unbounded memory growth
-        historyCleanupCounter++;
-        if (historyCleanupCounter % 16 == 0 && PLAYER_HISTORIES.size() > MAX_HISTORY_ENTRIES) {
-            PLAYER_HISTORIES.clear(); // Simplest safe cleanup — recalculation is cheap
-            return new ConversationHistory(config.getMaxContextTokens());
+        // LRU eviction: remove the oldest entry when over limit
+        if (historyCleanupCounter.incrementAndGet() % 16 == 0 && PLAYER_HISTORIES.size() > MAX_HISTORY_ENTRIES) {
+            // Remove a single random entry to stay under the limit, preserving most context
+            String toRemove = PLAYER_HISTORIES.keys().nextElement();
+            PLAYER_HISTORIES.remove(toRemove);
         }
         return PLAYER_HISTORIES.computeIfAbsent(playerId, k -> {
             ConversationHistory h = new ConversationHistory();
@@ -554,7 +600,8 @@ public class DeepSeekClient {
         StringBuilder sb = new StringBuilder();
         sb.append("You are an AI robot companion in Minecraft. ");
         sb.append("You control a robot entity that can perform actions in the game. ");
-        sb.append("You are SMART and AUTONOMOUS — you decide the best actions based on the situation. ");
+        sb.append("You are SMART, CREATIVE, and AUTONOMOUS — you understand complex building requests ");
+        sb.append("and can decompose them into executable actions. ");
         sb.append("The player will give you commands in natural language (Chinese or English). ");
         sb.append("You MUST respond with a valid JSON object containing an \"actions\" array.\n\n");
 
@@ -576,26 +623,72 @@ public class DeepSeekClient {
         sb.append("- stay: Stop and stay at current position.\n");
         sb.append("- attack: Attack a mob. target=\"nearest_hostile\" or describe the mob. ");
         sb.append("I will automatically strafe and dodge during combat.\n");
-        sb.append("- mine: Break a block. Provide position {x, y, z} relative to the robot ");
-        sb.append("(e.g., x:0, y:-1, z:0 for block below). I auto-equip the best tool!\n");
-        sb.append("- place: Place a single block. Provide {x, y, z} and item name.\n");
-        sb.append("- build: Build an entire structure automatically! The robot will place ");
-        sb.append("all blocks on its own. \n");
-        sb.append("  Available structures: \"house\" (house with walls/roof), \"wall\" (defensive wall), ");
-        sb.append("\"tower\" (lookout tower), \"hut\" (tiny shelter), ");
-        sb.append("\"bridge\" (path with railings), \"stairs\" (ascending staircase), ");
-        sb.append("\"platform\" (flat raised surface), \"shelter\" (simple roof), ");
-        sb.append("\"road\" (flat path).\n");
+        sb.append("- mine: Break a block. Provide ABSOLUTE world coordinates {x, y, z}. ");
+        sb.append("Use the robot's position as reference. For block below, subtract 1 from robot Y.\n");
+        sb.append("- place: Place a single block. Provide ABSOLUTE {x, y, z} and item name.\n");
+
+        // ── BUILD action (expanded with all structures) ──
+        sb.append("- build: Build a structure using the robot's template system. ");
+        sb.append("Use this for standard structures. The robot places all blocks automatically.\n");
+        sb.append("  Available structures: \"house\", \"wall\", \"tower\", \"hut\", ");
+        sb.append("\"bridge\", \"stairs\", \"platform\", \"shelter\", \"road\", ");
+        sb.append("\"fountain\", \"statue\", \"pyramid\", \"pool\", \"garden\", \"pillar\", \"arch\", \"farm\".\n");
         sb.append("  Sizes: \"small\", \"medium\", \"large\".\n");
         sb.append("  Materials: \"oak\", \"stone\", \"birch\", \"spruce\", \"dark_oak\", \"acacia\", \"cobblestone\".\n");
         sb.append("  Examples:\n");
         sb.append("    House: {\"type\":\"build\",\"structure\":\"house\",\"size\":\"medium\",\"material\":\"oak\"}\n");
-        sb.append("    Bridge: {\"type\":\"build\",\"structure\":\"bridge\",\"size\":\"large\",\"material\":\"stone\"}\n");
-        sb.append("    Stairs: {\"type\":\"build\",\"structure\":\"stairs\",\"size\":\"small\"}\n");
-        sb.append("    Road: {\"type\":\"build\",\"structure\":\"road\",\"material\":\"stone\"}\n");
-        sb.append("    Platform: {\"type\":\"build\",\"structure\":\"platform\",\"size\":\"large\"}\n");
-        sb.append("  IMPORTANT: When the player asks 'build a house/bridge/stairs/road/platform/shelter/tower/wall', ");
-        sb.append("ALWAYS use the 'build' action! Do NOT list individual block placements.\n");
+        sb.append("    Statue: {\"type\":\"build\",\"structure\":\"statue\",\"size\":\"large\",\"material\":\"stone\"}\n");
+        sb.append("    Pyramid: {\"type\":\"build\",\"structure\":\"pyramid\",\"size\":\"large\",\"material\":\"stone\"}\n");
+        sb.append("    Fountain: {\"type\":\"build\",\"structure\":\"fountain\",\"size\":\"medium\",\"material\":\"stone\"}\n");
+        sb.append("    Pool: {\"type\":\"build\",\"structure\":\"pool\",\"size\":\"medium\"}\n");
+        sb.append("    Garden: {\"type\":\"build\",\"structure\":\"garden\",\"size\":\"small\"}\n");
+        sb.append("    Pillar: {\"type\":\"build\",\"structure\":\"pillar\",\"size\":\"large\",\"material\":\"stone\"}\n");
+        sb.append("    Farm: {\"type\":\"build\",\"structure\":\"farm\",\"size\":\"large\"}\n");
+
+        // ── COMMAND action (for custom builds!) ──
+        sb.append("- command: Execute a SINGLE Minecraft command. Use \"command\" field with the command (no /).\n");
+        sb.append("  Use @p for the player name. Use ~ ~ ~ for coordinates relative to execution position.\n");
+        sb.append("  DO NOT use command for teleportation — use the 'tp' action type instead.\n");
+        sb.append("  ⚠️ SECURITY: /tp /teleport /op /ban /kick /stop /restart are BLOCKED. Don't use them.\n");
+        sb.append("  Examples:\n");
+        sb.append("    {\"type\":\"command\",\"command\":\"give @p minecraft:white_wool 64\"}\n");
+        sb.append("    {\"type\":\"command\",\"command\":\"setblock ~ ~1 ~ minecraft:grass_block\"}\n");
+        sb.append("    {\"type\":\"command\",\"command\":\"fill ~1 ~ ~1 ~5 ~3 ~5 minecraft:stone\"}\n\n");
+
+        // ── CUSTOM BUILDING: Use commands array! ──
+        sb.append("=== 🔨 CUSTOM BUILDING — HOW TO BUILD ANYTHING ===\n");
+        sb.append("When the player asks for something NOT in the template list (e.g., \"build a sculpture\", ");
+        sb.append("\"build a car\", \"build a dragon\", \"build a copy of me\"), you MUST use the ");
+        sb.append("\"commands\" array with /fill and /setblock commands to create the shape!\n\n");
+        sb.append("CRITICAL RULES for custom building:\n");
+        sb.append("1. Use the 'command' action type with a \"commands\" array (NOT a single \"command\").\n");
+        sb.append("2. Each entry in \"commands\" is one /fill or /setblock command (without the /).\n");
+        sb.append("3. Use /fill for rectangular volumes (bulk blocks). Use /setblock for individual blocks.\n");
+        sb.append("4. Coordinates are ABSOLUTE world coordinates. Use the robot's current position as origin.\n");
+        sb.append("5. Break complex shapes into layers of /fill rects. Be creative!\n");
+        sb.append("6. Limit to ~15 commands max per response to avoid overwhelming the system.\n");
+        sb.append("7. After placing blocks with commands, add a 'build' action with the structure ");
+        sb.append("to let the bot handle the remaining detail work.\n\n");
+        sb.append("Custom build example — player says \"build a 3x3x3 cube of diamond blocks\":\n");
+        sb.append("{\"actions\":[{\"type\":\"command\",\"commands\":[");
+        sb.append("\"fill ~ ~ ~ ~2 ~2 ~2 minecraft:diamond_block\"]}]}\n\n");
+        sb.append("Custom build example — player says \"build a big cross/cross-shaped monument\":\n");
+        sb.append("{\"actions\":[{\"type\":\"command\",\"commands\":[");
+        sb.append("\"fill ~-1 ~ ~5 ~1 ~3 ~5 minecraft:stone\",");
+        sb.append("\"fill ~-5 ~ ~-1 ~5 ~3 ~1 minecraft:stone\",");
+        sb.append("\"fill ~ ~4 ~-5 ~ ~4 ~5 minecraft:glowstone\"]}]}\n\n");
+        sb.append("Custom build example — player says \"build a statue/sculpture of me\":\n");
+        sb.append("Use the 'build' action with structure=\"statue\" FIRST. ");
+        sb.append("Then add commands for custom details:\n");
+        sb.append("{\"actions\":[");
+        sb.append("{\"type\":\"build\",\"structure\":\"statue\",\"size\":\"large\",\"material\":\"stone\"},");
+        sb.append("{\"type\":\"command\",\"commands\":[");
+        sb.append("\"fill ~-1 ~5 ~-1 ~1 ~6 ~1 minecraft:white_wool\",");
+        sb.append("\"setblock ~ ~7 ~ minecraft:glowstone\"]}]}\n\n");
+        sb.append("If you truly cannot decompose the build into fills/setblocks, use the 'build' action ");
+        sb.append("with structure=\"statue\" for humanoid shapes, or structure=\"pillar\" for columns, etc. ");
+        sb.append("The description field is optional — use it to tell the player what you're about to build.\n\n");
+
         sb.append("- collect: Pick up nearby dropped items.\n");
         sb.append("- equip: Equip a tool/weapon/armor. item=\"sword\"/\"pickaxe\"/\"axe\"/\"helmet\" etc.\n");
         sb.append("- eat: Eat food from inventory.\n");
@@ -606,20 +699,21 @@ public class DeepSeekClient {
         sb.append("- idle: Do nothing.\n");
         sb.append("- tp: Teleport the robot to a location. target=\"owner\" to teleport to the player, ");
         sb.append("or provide x, y, z coordinates. ");
-        sb.append("Example: {\"type\":\"tp\",\"target\":\"owner\"} or {\"type\":\"tp\",\"x\":100,\"y\":64,\"z\":200}\n");
-        sb.append("- command: Execute a Minecraft command (use for /give, /setblock, etc.). ");
-        sb.append("Provide \"command\" field with the command text (without /). ");
-        sb.append("Use @p for the player name. ");
-        sb.append("DO NOT use command for teleportation — use the 'tp' action type instead.\n");
-        sb.append("Examples: {\"type\":\"command\",\"command\":\"give @p minecraft:white_wool 64\"}, ");
-        sb.append("{\"type\":\"command\",\"command\":\"setblock ~ ~1 ~ minecraft:grass_block\"}.\n\n");
+        sb.append("Example: {\"type\":\"tp\",\"target\":\"owner\"} or {\"type\":\"tp\",\"x\":100,\"y\":64,\"z\":200}\n\n");
 
         sb.append("=== AI DECISION-MAKING GUIDELINES ===\n");
         sb.append("You are an intelligent AI. You should:\n");
         sb.append("- When the player says vague commands like \"go mining\" or \"get resources\", ");
         sb.append("decide the best blocks to mine based on what's nearby.\n");
-        sb.append("- When the player says \"build a house\" / \"造个房子\" / \"build a bridge\" / any structure request, ");
-        sb.append("use the 'build' action with appropriate structure/size/material.\n");
+        sb.append("- When the player asks for a standard structure (house, wall, tower, etc.), ");
+        sb.append("use the 'build' action with the correct structure name.\n");
+        sb.append("- When the player asks for something CUSTOM (statue, sculpture, car, dragon, ");
+        sb.append("\"build something like me\", any non-template shape), ");
+        sb.append("use 'command' actions with /fill commands to create the shape! ");
+        sb.append("Decompose the shape into rectangular volumes and build it layer by layer.\n");
+        sb.append("- When the player says \"build a statue\" or \"build a sculpture of me\" or \"建造一个和我一样的雕塑\", ");
+        sb.append("use build action with structure=\"statue\" for the humanoid template, ");
+        sb.append("then add command actions to customize it.\n");
         sb.append("- When attacked by mobs, defend yourself automatically (use attack action).\n");
         sb.append("- If you're low on health or hunger, eat food from your inventory.\n");
         sb.append("- Use tp action when you need to get somewhere far quickly.\n");
@@ -627,14 +721,18 @@ public class DeepSeekClient {
         sb.append("(e.g., tp to location → mine blocks → collect drops → tp back).\n");
         sb.append("- Be proactive: if the player is being attacked, offer to help.\n");
         sb.append("- If the player gives a command that doesn't specify coordinates, ");
-        sb.append("make reasonable assumptions (e.g., \"mine below\" = block under robot).\n\n");
+        sb.append("make reasonable assumptions (e.g., \"mine below\" = block under robot).\n");
+        sb.append("- ⭐ CREATIVE MODE: When the player is in creative mode, you don't need to check ");
+        sb.append("inventory for materials. Give blocks freely with /give and build without limits!\n\n");
 
         sb.append("Response format (JSON only, no markdown):\n");
         sb.append("{\"actions\": [{\"type\": \"action_type\", ...}, ...]}\n\n");
 
         sb.append("Each action object must have a \"type\" field. Additional fields depend on the action.\n");
         sb.append("For chat, include \"message\". For attack, include \"target\". ");
-        sb.append("For mine/place/goto, include position {x, y, z} relative to the robot.\n");
+        sb.append("For mine/place/goto, include position {x, y, z}.\n");
+        sb.append("For build, include \"structure\" + optional \"size\" and \"material\".\n");
+        sb.append("For command, include \"command\" (single) OR \"commands\" (array of strings).\n");
         sb.append("You can chain multiple actions. Keep responses concise.\n\n");
 
         // Add game context
@@ -643,6 +741,18 @@ public class DeepSeekClient {
         sb.append("Player position: ").append(formatPos(player.getBlockPos())).append("\n");
         sb.append("Player health: ").append(String.format("%.0f", player.getHealth())).append("/")
                 .append(String.format("%.0f", player.getMaxHealth())).append("\n");
+
+        // Game mode — CRITICAL for building decisions!
+        boolean isCreative = player.isCreative();
+        sb.append("Player game mode: ").append(isCreative ? "CREATIVE" : "SURVIVAL").append("\n");
+        if (isCreative) {
+            sb.append("⭐ CREATIVE MODE ACTIVE: You can build ANYTHING without needing materials! ");
+            sb.append("Use /give to get any block you need. Use /fill for bulk placement. ");
+            sb.append("The robot can place blocks without consuming inventory items.\n");
+        } else {
+            sb.append("SURVIVAL MODE: The robot needs actual blocks in its inventory to build. ");
+            sb.append("Check robot inventory before building large structures.\n");
+        }
 
         // ⚠️  Use player.getEntityWorld() instead of MinecraftClient.getInstance().world —
         //     this method runs on the SERVER thread where MinecraftClient is not available!
@@ -653,12 +763,19 @@ public class DeepSeekClient {
                 sb.append("Dimension: ").append(playerWorld.getRegistryKey().getValue()).append("\n");
             }
 
-            // Scan nearby entities (16 block radius) — server-safe API
+            // Scan nearby entities (16 block radius) — use 5s cache to reduce TPS impact
             Box searchBox = player.getBoundingBox().expand(16);
-            List<Entity> nearby = List.of();
+            List<Entity> nearby;
             if (playerWorld instanceof ServerWorld serverWorld) {
-                nearby = serverWorld.getOtherEntities(player, searchBox,
-                    e -> e instanceof HostileEntity || e instanceof AnimalEntity || e instanceof PlayerEntity);
+                long now = System.currentTimeMillis();
+                if (now > entityCacheExpiry) {
+                    cachedNearbyEntities = serverWorld.getOtherEntities(player, searchBox,
+                        e -> e instanceof HostileEntity || e instanceof AnimalEntity || e instanceof PlayerEntity);
+                    entityCacheExpiry = now + 5000; // cache for 5 seconds
+                }
+                nearby = cachedNearbyEntities;
+            } else {
+                nearby = List.of();
             }
 
             if (!nearby.isEmpty()) {

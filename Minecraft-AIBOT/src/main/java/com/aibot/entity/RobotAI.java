@@ -31,22 +31,24 @@ public class RobotAI {
         String command,
         String structure,
         String size,
-        String material
+        String material,
+        String description,
+        java.util.List<String> commands
     ) {
         public QueuedAction(ActionTypes type) {
-            this(type, null, null, null, null, 0, null, null, null, null);
+            this(type, null, null, null, null, 0, null, null, null, null, null, null);
         }
 
         public QueuedAction(ActionTypes type, String target) {
-            this(type, target, null, null, null, 0, null, null, null, null);
+            this(type, target, null, null, null, 0, null, null, null, null, null, null);
         }
 
         public QueuedAction(ActionTypes type, BlockPos pos) {
-            this(type, null, pos, null, null, 0, null, null, null, null);
+            this(type, null, pos, null, null, 0, null, null, null, null, null, null);
         }
 
         public QueuedAction(ActionTypes type, String target, BlockPos pos) {
-            this(type, target, pos, null, null, 0, null, null, null, null);
+            this(type, target, pos, null, null, 0, null, null, null, null, null, null);
         }
     }
 
@@ -68,7 +70,9 @@ public class RobotAI {
             parsed.command,
             parsed.structure,
             parsed.size,
-            parsed.material
+            parsed.material,
+            parsed.description,
+            parsed.commands
         );
     }
 
