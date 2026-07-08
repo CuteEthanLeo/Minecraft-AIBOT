@@ -110,7 +110,7 @@ public class RobotEntity extends PathAwareEntity {
             cachedRef = new java.lang.ref.SoftReference<>(this);
             // Show name tag above the robot at all times
             this.setCustomName(Text.literal("§8[§d✦§8] §5AI-Bot"));
-            this.setCustomNameVisible(true);
+            updateModelNameTag(BotConfig.load());
         }
     }
 
@@ -176,6 +176,10 @@ public class RobotEntity extends PathAwareEntity {
         if (!this.getEntityWorld().isClient()) {
             // Load config once per tick (not per-call) to avoid repeated file I/O
             BotConfig cfg = BotConfig.load();
+
+            if (this.age % 40 == 0) {
+                updateModelNameTag(cfg);
+            }
 
             // Persist robot position every ~5 seconds (survives chunk unloads)
             if (this.age % 100 == 0) {
@@ -259,6 +263,11 @@ public class RobotEntity extends PathAwareEntity {
                 );
             }
         }
+    }
+
+    private void updateModelNameTag(BotConfig cfg) {
+        this.setCustomName(Text.literal("AI-Bot | " + cfg.getModelDisplayName()));
+        this.setCustomNameVisible(true);
     }
 
     // ==================== Owner Management ====================

@@ -16,7 +16,7 @@ import net.minecraft.util.math.MathHelper;
  */
 public class RobotModel extends EntityModel<RobotEntityRenderState> {
 
-    public static final Identifier TEXTURE = Identifier.ofVanilla("textures/entity/player/wide/steve.png");
+    public static final Identifier TEXTURE = Identifier.of("aibot", "textures/entity/robot.png");
     public static final EntityModelLayer LAYER = new EntityModelLayer(Identifier.of("aibot", "robot"), "main");
 
     private final ModelPart head;

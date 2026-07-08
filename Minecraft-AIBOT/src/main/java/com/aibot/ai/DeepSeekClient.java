@@ -97,21 +97,8 @@ public class DeepSeekClient {
                     lastApiError = null;
                     return extractContent(response.body(), provider);
                 })
-                .thenApply(responseText -> {
-                    if (!responseText.isEmpty() && config.isConversationContext()) {
-                        history.addAssistantMessage(responseText);
-                    }
-                    if (responseText.isEmpty() && lastApiError != null) {
-                        // API error — return error action for player feedback
-                        List<ParsedAction> errorActions = new ArrayList<>();
-                        ParsedAction errAction = new ParsedAction();
-                        errAction.type = ActionTypes.CHAT;
-                        errAction.message = "❌ API错误: " + lastApiError + " — 请检查API Key和网络连接";
-                        errorActions.add(errAction);
-                        return errorActions;
-                    }
-                    return CommandParser.parse(responseText);
-                })
+                .thenCompose(responseText -> validateOrRepairBuildPlan(
+                    command, responseText, systemPrompt, history, config))
                 .exceptionally(ex -> {
                     String errMsg = "[AIBot] API call failed: " + ex.getMessage();
                     System.err.println(errMsg);
@@ -123,6 +110,169 @@ public class DeepSeekClient {
                     errorActions.add(errAction);
                     return errorActions;
                 });
+    }
+
+    /**
+     * Hard gate for building requests. Bare templates are rejected and repaired once.
+     */
+    private static CompletableFuture<List<ParsedAction>> validateOrRepairBuildPlan(
+            String playerCommand,
+            String responseText,
+            String systemPrompt,
+            ConversationHistory history,
+            BotConfig config
+    ) {
+        if (responseText == null) responseText = "";
+
+        if (responseText.isEmpty() && lastApiError != null) {
+            return CompletableFuture.completedFuture(apiErrorActions());
+        }
+
+        List<ParsedAction> actions = CommandParser.parse(responseText);
+        if (!isBuildRequest(playerCommand) || isDetailedBuildPlan(actions)) {
+            rememberAssistantResponse(history, config, responseText);
+            return CompletableFuture.completedFuture(actions);
+        }
+
+        System.out.println("[AIBot] Build plan failed detail gate; requesting strict blueprint repair.");
+        return requestBuildPlanRepair(systemPrompt, playerCommand, responseText, config)
+                .thenApply(repairText -> {
+                    if (repairText != null && !repairText.isBlank()) {
+                        List<ParsedAction> repaired = CommandParser.parse(repairText);
+                        if (isDetailedBuildPlan(repaired)) {
+                            rememberAssistantResponse(history, config, repairText);
+                            return repaired;
+                        }
+                        System.err.println("[AIBot] Repaired build plan still failed detail gate; blocking execution.");
+                    }
+                    return buildPlanRejectedActions();
+                });
+    }
+
+    private static CompletableFuture<String> requestBuildPlanRepair(
+            String systemPrompt,
+            String playerCommand,
+            String rejectedResponse,
+            BotConfig config
+    ) {
+        String repairSystemPrompt = systemPrompt
+                + "\n\n=== STRICT BUILD PLAN REPAIR ===\n"
+                + "The previous answer failed the build-quality gate. You must repair it now.\n"
+                + "Return JSON only. For a building request, do not return a bare template.\n"
+                + "A valid build plan must include either:\n"
+                + "1. a build action with structure, description, and commands containing fill/setblock details, or\n"
+                + "2. a command action with commands containing fill/setblock details.\n"
+                + "The description must explain the interpreted design. The commands must create recognizable details.\n";
+
+        String repairUserMessage = "Original player command:\n" + playerCommand
+                + "\n\nRejected response:\n" + rejectedResponse
+                + "\n\nReturn a corrected JSON object with an actions array now.";
+
+        String provider = config.getApiProvider();
+        HttpRequest repairRequest;
+        switch (config.getApiFormat()) {
+            case "claude" -> repairRequest = buildClaudeRequestRaw(repairSystemPrompt, repairUserMessage, config);
+            case "gemini" -> repairRequest = buildGeminiRequestRaw(repairSystemPrompt, repairUserMessage, config);
+            default -> repairRequest = buildOpenAIRequestRaw(repairSystemPrompt, repairUserMessage, config);
+        }
+
+        return HTTP_CLIENT.sendAsync(repairRequest, HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    if (response.statusCode() != 200 && response.statusCode() != 201) {
+                        System.err.println("[AIBot] Build repair API error " + response.statusCode());
+                        return "";
+                    }
+                    return extractContent(response.body(), provider);
+                })
+                .exceptionally(ex -> {
+                    System.err.println("[AIBot] Build repair failed: " + ex.getMessage());
+                    return "";
+                });
+    }
+
+    private static boolean isBuildRequest(String command) {
+        if (command == null) return false;
+        String text = command.toLowerCase();
+        String[] keywords = {
+            "build", "make", "create", "construct", "house", "tower", "hut", "wall", "bridge",
+            "statue", "sculpture", "fountain", "garden", "farm", "road", "platform", "castle",
+            "car", "dragon", "robot", "base", "shelter", "room", "roof",
+            "\u5efa", "\u9020", "\u5efa\u7b51", "\u623f", "\u5c4b", "\u5854", "\u5899", "\u6865",
+            "\u96d5\u50cf", "\u96d5\u5851", "\u55b7\u6cc9", "\u82b1\u56ed", "\u519c\u573a",
+            "\u8def", "\u5e73\u53f0", "\u57ce\u5821", "\u8f66", "\u9f99", "\u57fa\u5730",
+            "\u5e87\u62a4\u6240", "\u5c4b\u9876"
+        };
+        for (String keyword : keywords) {
+            if (text.contains(keyword)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isDetailedBuildPlan(List<ParsedAction> actions) {
+        if (actions == null || actions.isEmpty()) return false;
+
+        boolean hasBuildWork = false;
+        boolean hasConcreteCommands = false;
+        for (ParsedAction action : actions) {
+            if (action == null || action.type == null) continue;
+            if (action.type == ActionTypes.BUILD) {
+                hasBuildWork = true;
+                if (isBlank(action.description)) {
+                    return false;
+                }
+                if (hasConcreteBuildCommands(action)) {
+                    hasConcreteCommands = true;
+                }
+            } else if (action.type == ActionTypes.COMMAND && hasConcreteBuildCommands(action)) {
+                hasBuildWork = true;
+                hasConcreteCommands = true;
+            }
+        }
+        return hasBuildWork && hasConcreteCommands;
+    }
+
+    private static boolean hasConcreteBuildCommands(ParsedAction action) {
+        if (action == null) return false;
+        if (isConcreteBuildCommand(action.command)) return true;
+        if (action.commands == null) return false;
+        for (String command : action.commands) {
+            if (isConcreteBuildCommand(command)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isConcreteBuildCommand(String command) {
+        if (command == null) return false;
+        String trimmed = command.trim().toLowerCase();
+        return trimmed.startsWith("fill ") || trimmed.startsWith("setblock ");
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private static void rememberAssistantResponse(ConversationHistory history, BotConfig config, String responseText) {
+        if (responseText != null && !responseText.isEmpty() && config.isConversationContext()) {
+            history.addAssistantMessage(responseText);
+        }
+    }
+
+    private static List<ParsedAction> apiErrorActions() {
+        List<ParsedAction> errorActions = new ArrayList<>();
+        ParsedAction errAction = new ParsedAction();
+        errAction.type = ActionTypes.CHAT;
+        errAction.message = "API error: " + lastApiError + ". Please check API Key and network.";
+        errorActions.add(errAction);
+        return errorActions;
+    }
+
+    private static List<ParsedAction> buildPlanRejectedActions() {
+        List<ParsedAction> actions = new ArrayList<>();
+        ParsedAction chat = new ParsedAction();
+        chat.type = ActionTypes.CHAT;
+        chat.message = "\u8fd9\u6b21\u5efa\u7b51\u84dd\u56fe\u4e0d\u591f\u5177\u4f53\uff0c\u6211\u5df2\u62e6\u622a\u7eaf\u6a21\u677f\u7ed3\u679c\uff0c\u907f\u514d\u4e71\u5efa\u3002\u8bf7\u518d\u53d1\u4e00\u6b21\u6216\u63cf\u8ff0\u5f97\u66f4\u5177\u4f53\u4e00\u70b9\u3002";
+        actions.add(chat);
+        return actions;
     }
 
     /** Last API error message for ChatHandler to display to the player. */
@@ -628,22 +778,17 @@ public class DeepSeekClient {
         sb.append("- place: Place a single block. Provide ABSOLUTE {x, y, z} and item name.\n");
 
         // ── BUILD action (expanded with all structures) ──
-        sb.append("- build: Build a structure using the robot's template system. ");
-        sb.append("Use this for standard structures. The robot places all blocks automatically.\n");
+        sb.append("- build: Build a structure using the robot's template system only as a rough structural skeleton. ");
+        sb.append("Never use a template as the whole answer to a building request; include a description and add custom commands for the requested details.\n");
         sb.append("  Available structures: \"house\", \"wall\", \"tower\", \"hut\", ");
         sb.append("\"bridge\", \"stairs\", \"platform\", \"shelter\", \"road\", ");
         sb.append("\"fountain\", \"statue\", \"pyramid\", \"pool\", \"garden\", \"pillar\", \"arch\", \"farm\".\n");
         sb.append("  Sizes: \"small\", \"medium\", \"large\".\n");
         sb.append("  Materials: \"oak\", \"stone\", \"birch\", \"spruce\", \"dark_oak\", \"acacia\", \"cobblestone\".\n");
-        sb.append("  Examples:\n");
-        sb.append("    House: {\"type\":\"build\",\"structure\":\"house\",\"size\":\"medium\",\"material\":\"oak\"}\n");
-        sb.append("    Statue: {\"type\":\"build\",\"structure\":\"statue\",\"size\":\"large\",\"material\":\"stone\"}\n");
-        sb.append("    Pyramid: {\"type\":\"build\",\"structure\":\"pyramid\",\"size\":\"large\",\"material\":\"stone\"}\n");
-        sb.append("    Fountain: {\"type\":\"build\",\"structure\":\"fountain\",\"size\":\"medium\",\"material\":\"stone\"}\n");
-        sb.append("    Pool: {\"type\":\"build\",\"structure\":\"pool\",\"size\":\"medium\"}\n");
-        sb.append("    Garden: {\"type\":\"build\",\"structure\":\"garden\",\"size\":\"small\"}\n");
-        sb.append("    Pillar: {\"type\":\"build\",\"structure\":\"pillar\",\"size\":\"large\",\"material\":\"stone\"}\n");
-        sb.append("    Farm: {\"type\":\"build\",\"structure\":\"farm\",\"size\":\"large\"}\n");
+        sb.append("  Examples must include interpretation, not just template names:\n");
+        sb.append("    House: {\"type\":\"build\",\"structure\":\"house\",\"size\":\"medium\",\"material\":\"oak\",\"description\":\"cozy oak house with front windows, lit doorway, and peaked roof\",\"commands\":[\"setblock ~3 ~2 ~0 minecraft:glass_pane\",\"setblock ~4 ~2 ~0 minecraft:glass_pane\",\"setblock ~3 ~4 ~0 minecraft:lantern\"]}\n");
+        sb.append("    Statue: {\"type\":\"build\",\"structure\":\"statue\",\"size\":\"large\",\"material\":\"stone\",\"description\":\"humanoid statue skeleton with custom head, colored eyes, and raised arm\",\"commands\":[\"setblock ~0 ~9 ~-1 minecraft:glowstone\",\"fill ~-3 ~6 ~0 ~-5 ~6 ~0 minecraft:stone\"]}\n");
+        sb.append("    Fountain: {\"type\":\"build\",\"structure\":\"fountain\",\"size\":\"medium\",\"material\":\"stone\",\"description\":\"round stone fountain with water column and glowstone highlights\",\"commands\":[\"setblock ~0 ~3 ~0 minecraft:glowstone\",\"setblock ~2 ~1 ~0 minecraft:sea_lantern\"]}\n");
 
         // ── COMMAND action (for custom builds!) ──
         sb.append("- command: Execute a SINGLE Minecraft command. Use \"command\" field with the command (no /).\n");
@@ -656,19 +801,21 @@ public class DeepSeekClient {
         sb.append("    {\"type\":\"command\",\"command\":\"fill ~1 ~ ~1 ~5 ~3 ~5 minecraft:stone\"}\n\n");
 
         // ── CUSTOM BUILDING: Use commands array! ──
-        sb.append("=== 🔨 CUSTOM BUILDING — HOW TO BUILD ANYTHING ===\n");
-        sb.append("When the player asks for something NOT in the template list (e.g., \"build a sculpture\", ");
-        sb.append("\"build a car\", \"build a dragon\", \"build a copy of me\"), you MUST use the ");
-        sb.append("\"commands\" array with /fill and /setblock commands to create the shape!\n\n");
+        sb.append("=== BUILDING UNDERSTANDING MODE - REQUIRED FOR EVERY BUILD ===\n");
+        sb.append("For EVERY building request, first understand the object: purpose, silhouette, main parts, scale, material palette, and recognizable details. ");
+        sb.append("Then convert that understanding into a compact Minecraft blueprint using build, fill, and setblock actions.\n");
+        sb.append("Do not simply map the request to house/tower/hut/wall. Templates are only foundations or helper skeletons. ");
+        sb.append("If the player asks for a house, still infer style, rooms, roof, windows, entrance, and decorations from the wording. ");
+        sb.append("If details are missing, make reasonable creative choices and encode them in description plus commands.\n\n");
         sb.append("CRITICAL RULES for custom building:\n");
-        sb.append("1. Use the 'command' action type with a \"commands\" array (NOT a single \"command\").\n");
+        sb.append("1. Prefer one build action with structure/size/material/description plus a commands array for custom details, or a command action with commands if no template skeleton fits.\n");
         sb.append("2. Each entry in \"commands\" is one /fill or /setblock command (without the /).\n");
         sb.append("3. Use /fill for rectangular volumes (bulk blocks). Use /setblock for individual blocks.\n");
-        sb.append("4. Coordinates are ABSOLUTE world coordinates. Use the robot's current position as origin.\n");
+        sb.append("4. Coordinates may use ~ relative coordinates; they are resolved around the robot. Keep the whole build in front/around the robot and avoid overwriting the player.\n");
         sb.append("5. Break complex shapes into layers of /fill rects. Be creative!\n");
         sb.append("6. Limit to ~15 commands max per response to avoid overwhelming the system.\n");
-        sb.append("7. After placing blocks with commands, add a 'build' action with the structure ");
-        sb.append("to let the bot handle the remaining detail work.\n\n");
+        sb.append("7. Do not end with only a template for any building request. Add recognizable features with /fill or /setblock.\n");
+        sb.append("8. Always include description on build actions explaining the interpreted blueprint in one short sentence.\n\n");
         sb.append("Custom build example — player says \"build a 3x3x3 cube of diamond blocks\":\n");
         sb.append("{\"actions\":[{\"type\":\"command\",\"commands\":[");
         sb.append("\"fill ~ ~ ~ ~2 ~2 ~2 minecraft:diamond_block\"]}]}\n\n");
@@ -685,9 +832,8 @@ public class DeepSeekClient {
         sb.append("{\"type\":\"command\",\"commands\":[");
         sb.append("\"fill ~-1 ~5 ~-1 ~1 ~6 ~1 minecraft:white_wool\",");
         sb.append("\"setblock ~ ~7 ~ minecraft:glowstone\"]}]}\n\n");
-        sb.append("If you truly cannot decompose the build into fills/setblocks, use the 'build' action ");
-        sb.append("with structure=\"statue\" for humanoid shapes, or structure=\"pillar\" for columns, etc. ");
-        sb.append("The description field is optional — use it to tell the player what you're about to build.\n\n");
+        sb.append("If a template is useful, use it only as a base and put the custom detail commands in the same build action. ");
+        sb.append("The description field is mandatory for build actions and must summarize your interpretation of the player request.\n\n");
 
         sb.append("- collect: Pick up nearby dropped items.\n");
         sb.append("- equip: Equip a tool/weapon/armor. item=\"sword\"/\"pickaxe\"/\"axe\"/\"helmet\" etc.\n");
@@ -705,15 +851,15 @@ public class DeepSeekClient {
         sb.append("You are an intelligent AI. You should:\n");
         sb.append("- When the player says vague commands like \"go mining\" or \"get resources\", ");
         sb.append("decide the best blocks to mine based on what's nearby.\n");
-        sb.append("- When the player asks for a standard structure (house, wall, tower, etc.), ");
-        sb.append("use the 'build' action with the correct structure name.\n");
+        sb.append("- When the player asks for any structure, do a design pass first: identify shape, function, size, style, materials, openings, decorations, and special requested features.\n");
+        sb.append("- For standard structures (house, wall, tower, etc.), use build as a skeleton only; include description and commands for windows, roof shape, entrance, lighting, trim, or other inferred details.\n");
         sb.append("- When the player asks for something CUSTOM (statue, sculpture, car, dragon, ");
         sb.append("\"build something like me\", any non-template shape), ");
         sb.append("use 'command' actions with /fill commands to create the shape! ");
         sb.append("Decompose the shape into rectangular volumes and build it layer by layer.\n");
         sb.append("- When the player says \"build a statue\" or \"build a sculpture of me\" or \"建造一个和我一样的雕塑\", ");
-        sb.append("use build action with structure=\"statue\" for the humanoid template, ");
-        sb.append("then add command actions to customize it.\n");
+        sb.append("use build action with structure=\"statue\" only as the body skeleton, ");
+        sb.append("then add commands for head, arms, colors, pose, and recognizable details.\n");
         sb.append("- When attacked by mobs, defend yourself automatically (use attack action).\n");
         sb.append("- If you're low on health or hunger, eat food from your inventory.\n");
         sb.append("- Use tp action when you need to get somewhere far quickly.\n");
@@ -731,7 +877,7 @@ public class DeepSeekClient {
         sb.append("Each action object must have a \"type\" field. Additional fields depend on the action.\n");
         sb.append("For chat, include \"message\". For attack, include \"target\". ");
         sb.append("For mine/place/goto, include position {x, y, z}.\n");
-        sb.append("For build, include \"structure\" + optional \"size\" and \"material\".\n");
+        sb.append("For build, include \"structure\", \"description\", optional \"size\"/\"material\", and usually \"commands\" for details.\n");
         sb.append("For command, include \"command\" (single) OR \"commands\" (array of strings).\n");
         sb.append("You can chain multiple actions. Keep responses concise.\n\n");
 
@@ -881,3 +1027,6 @@ public class DeepSeekClient {
         return pos.getX() + ", " + pos.getY() + ", " + pos.getZ();
     }
 }
+
+
+

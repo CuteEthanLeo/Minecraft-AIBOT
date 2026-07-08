@@ -9,7 +9,7 @@ import net.minecraft.util.Identifier;
  */
 public class RobotRenderer extends MobEntityRenderer<RobotEntity, RobotEntityRenderState, RobotModel> {
 
-    // Uses the Steve texture from RobotModel
+    // Uses the modded robot texture from RobotModel.
     private static final Identifier TEXTURE = RobotModel.TEXTURE;
 
     public RobotRenderer(EntityRendererFactory.Context context) {
